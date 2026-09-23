@@ -4,11 +4,10 @@ import * as XLSX from "xlsx";
 import ExcelJS from "exceljs";
 import { GoogleGenAI } from "@google/genai";
 
-// Vercel Serverless maximum execution time configuration (60 seconds)
 export const maxDuration = 60;
 export const dynamic = "force-dynamic";
 
-// Fallback Model Chain: If model hits rate limit/quota, automatically switch to backup model
+// Model auto-switch priority list
 const FALLBACK_MODEL_CHAIN = [
   "gemini-2.5-flash",
   "gemini-3.5-flash-lite",
@@ -17,16 +16,12 @@ const FALLBACK_MODEL_CHAIN = [
   "gemini-3.7-flash",
 ];
 
-/**
- * 1. Web Scraping Layer: Extracts HTML text and tables from University links
- */
 async function scrapeUniversityWebpage(url: string): Promise<string> {
   const headers = {
     "User-Agent":
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
     Accept:
       "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
   };
 
   const response = await fetch(url, { headers, cache: "no-store" });
@@ -37,10 +32,8 @@ async function scrapeUniversityWebpage(url: string): Promise<string> {
   const htmlText = await response.text();
   const $ = cheerio.load(htmlText);
 
-  // Remove scripts, inline styles, metadata to clean context
   $("script, style, noscript, nav, footer, iframe, header, svg").remove();
 
-  // Extract structured tables dynamically
   const tables: string[] = [];
   $("table").each((idx, el) => {
     const rows: string[] = [];
@@ -59,21 +52,16 @@ async function scrapeUniversityWebpage(url: string): Promise<string> {
         }
       });
     if (rows.length > 0) {
-      tables.push(`--- UNIVERSITY WEBPAGE TABLE ${idx + 1} ---\n` + rows.join("\n"));
+      tables.push(`--- UNIVERSITY TABLE ${idx + 1} ---\n` + rows.join("\n"));
     }
   });
 
   const bodyText = $("body").text().replace(/\s+/g, " ").trim();
-
   return `=== EXTRACTED WEBPAGE TABLES ===\n${tables.join(
     "\n\n"
-  )}\n\n=== MAIN WEBPAGE TEXT ===\n${bodyText.slice(0, 35000)}`;
+  )}\n\n=== MAIN WEBPAGE TEXT ===\n${bodyText.slice(0, 45000)}`;
 }
 
-/**
- * 2. Multi-API Key & Dual Model Fallback Gemini Call
- * Loops through API Keys AND Model Chain to ensure zero quota failures!
- */
 async function callGeminiWithFullFailover(
   apiKeys: string[],
   initialModel: string,
@@ -81,8 +69,6 @@ async function callGeminiWithFullFailover(
   systemInstruction: string
 ): Promise<{ text: string; modelUsed: string; keyUsedIndex: number }> {
   let lastError: Error | null = null;
-
-  // Build model try order starting with user chosen model
   const modelsToTry = [initialModel, ...FALLBACK_MODEL_CHAIN.filter((m) => m !== initialModel)];
 
   for (let keyIdx = 0; keyIdx < apiKeys.length; keyIdx++) {
@@ -114,24 +100,20 @@ async function callGeminiWithFullFailover(
         }
       } catch (err: any) {
         console.warn(
-          `Key #${keyIdx + 1} with Model '${currentModel}' failed: ${err?.message || err}. Trying next model/key...`
+          `Key #${keyIdx + 1} Model ${currentModel} failed: ${err?.message || err}. Trying next fallback...`
         );
         lastError = err;
-        // Continue loop to try next model or next API key
       }
     }
   }
 
   throw new Error(
-    `All provided Gemini API keys and model fallbacks failed or reached quota limits. Last error: ${
-      lastError?.message || "Unknown API error"
+    `All provided Gemini API keys & model fallbacks failed. Last error: ${
+      lastError?.message || "Unknown error"
     }`
   );
 }
 
-/**
- * Main API Handler
- */
 export async function POST(req: NextRequest) {
   try {
     const formData = await req.formData();
@@ -139,6 +121,7 @@ export async function POST(req: NextRequest) {
     const url = formData.get("url") as string | null;
     const apiKeysRaw = formData.get("apiKeys") as string | null;
     const selectedModel = (formData.get("model") as string | null) || "gemini-2.5-flash";
+    const customPrompt = (formData.get("customPrompt") as string | null) || "";
 
     if (!file || !url || !apiKeysRaw) {
       return NextResponse.json(
@@ -155,7 +138,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Step A: Parse uploaded Excel file buffer with XLSX
+    // Step A: Parse uploaded Excel file
     const arrayBuffer = await file.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
     const workbook = XLSX.read(buffer, { type: "buffer" });
@@ -175,47 +158,59 @@ export async function POST(req: NextRequest) {
     // Step B: Scrape University Webpage
     const webText = await scrapeUniversityWebpage(url);
 
-    // Step C: AI Reconciliation Prompt
-    const systemInstruction = `You are an expert university registrar AI assistant. 
-Your task is to update legacy Excel student/course/department records with fresh 2026 webpage data.
-Keep original column headers exactly as provided. Identify changed grades, updated statuses, modified course codes, or new student additions.
-Return strictly formatted JSON matching the required schema.`;
+    // Step C: Build Intelligent Prompt (Handling Batching, Auto-fill, and Teacher's Custom Instructions)
+    const systemInstruction = `You are an expert university registrar AI assistant and academic database administrator.
+Your task is to reconcile, update, and autofill course/student/faculty records from legacy Excel sheets with live university webpage data.
+CRITICAL RULES:
+1. AUTO-FILL: If an Excel row has empty, missing, or 'N/A' fields (e.g. course title, credit hours, instructor, department, room, prerequisite, 2026 grade), inspect the scraped web page data and AUTO-FILL those blank fields with correct information.
+2. UPDATE: If existing fields have changed in 2026 (e.g. course code changed from CS-101 to CS-1101, or updated grade/status), update the field.
+3. TEACHER'S CUSTOM INSTRUCTION: If the teacher gave custom instructions, obey them strictly.
+4. NEW RECORDS: If the webpage contains new courses or student records not present in the Excel sheet, append them under new_rows.
+5. PRESERVE COLUMNS: Keep exact column keys: ${JSON.stringify(columns)}.`;
 
+    const teacherInstructionSection = customPrompt.trim()
+      ? `TEACHER'S UNIQUE CUSTOM INSTRUCTIONS (PRIORITY):\n"${customPrompt.trim()}"\n`
+      : "";
+
+    // Support processing large sheets (up to 400 course rows) by passing compact row data
     const prompt = `
+${teacherInstructionSection}
 ORIGINAL EXCEL COLUMNS: ${JSON.stringify(columns)}
-LEGACY EXCEL DATA (JSON - First 150 rows):
-${JSON.stringify(excelRows.slice(0, 150), null, 2)}
+TOTAL ROWS IN EXCEL: ${excelRows.length}
 
-FRESH 2026 SCRAPED UNIVERSITY WEBPAGE CONTENT:
+EXCEL ROWS TO RECONCILE (JSON):
+${JSON.stringify(excelRows.slice(0, 450), null, 1)}
+
+LIVE SCRAPED UNIVERSITY WEBPAGE CONTENT:
 ${webText}
 
 INSTRUCTIONS:
-1. Match entity records (students, courses, faculty, IDs) from the Excel sheet with the scraped 2026 web data.
-2. For any row with 2026 updates, provide the modified row and specify which column names changed.
-3. If new 2026 records exist on the webpage that are not in the original Excel sheet, add them under 'new_rows'.
-4. Do NOT change column header names. Use exact column keys: ${JSON.stringify(columns)}.
+1. Compare each row (course, student, faculty, or code) against the live university webpage.
+2. AUTO-FILL BLANKS: For any row where one or more columns are blank, empty (""), null, or missing, look up that course/entity on the webpage and fill in the missing data.
+3. Mark updated/autofilled column names in 'changed_columns'.
+4. If there are new courses or records on the webpage not in the Excel, include them in 'new_rows'.
 
 REQUIRED JSON RESPONSE STRUCTURE:
 {
   "updated_rows": [
     {
       "row_index": 0,
-      "updated_data": { "Col1": "Val", "Col2": "UpdatedVal" },
-      "changed_columns": ["Col2"],
-      "reason": "Updated 2026 grade based on university result table"
+      "updated_data": { "CourseCode": "CS101", "CourseTitle": "Intro to AI", "Credits": "3" },
+      "changed_columns": ["CourseTitle", "Credits"],
+      "reason": "Autofilled missing Course Title and updated credits from university portal"
     }
   ],
   "new_rows": [
     {
-      "data": { "Col1": "Val", "Col2": "Val" },
-      "reason": "Newly enrolled 2026 record"
+      "data": { "CourseCode": "CS401", "CourseTitle": "Advanced Machine Learning" },
+      "reason": "New 2026 course catalog entry"
     }
   ],
-  "summary": "2-sentence executive summary of reconciled records."
+  "summary": "2-sentence executive summary of autofilled and updated courses."
 }
 `;
 
-    // Step D: Call Gemini with Dual Failover (API Keys + Auto Model Switch)
+    // Step D: Execute AI reasoning with dual failover
     const { text: rawAiResponse, modelUsed, keyUsedIndex } = await callGeminiWithFullFailover(
       apiKeys,
       selectedModel,
@@ -227,23 +222,20 @@ REQUIRED JSON RESPONSE STRUCTURE:
     try {
       aiResult = JSON.parse(rawAiResponse);
     } catch {
-      // Regex extraction fallback
       const jsonMatch = rawAiResponse.match(/\{[\s\S]*\}/);
       if (jsonMatch) {
         aiResult = JSON.parse(jsonMatch[0]);
       } else {
-        throw new Error("Failed to parse AI output into valid JSON.");
+        throw new Error("Failed to parse AI response into JSON format.");
       }
     }
 
-    // Step E: Create Styled Excel Workbook with ExcelJS
+    // Step E: Create Workbook with Openpyxl / ExcelJS Styling
     const outputWb = new ExcelJS.Workbook();
     const ws = outputWb.addWorksheet("2026 Updated Records");
 
-    // Add Headers
-    ws.columns = columns.map((col) => ({ header: col, key: col, width: 20 }));
+    ws.columns = columns.map((col) => ({ header: col, key: col, width: 22 }));
 
-    // Apply header styling
     const headerRow = ws.getRow(1);
     headerRow.eachCell((cell) => {
       cell.fill = {
@@ -255,11 +247,10 @@ REQUIRED JSON RESPONSE STRUCTURE:
       cell.alignment = { vertical: "middle", horizontal: "center" };
     });
 
-    // Populate data & track cell modifications
     const updatedExcelRows = [...excelRows];
     const modifiedCellSet = new Set<string>();
 
-    // Process AI updates
+    // Apply updates and autofills
     const updatedRowsList = aiResult.updated_rows || [];
     for (const item of updatedRowsList) {
       const rIdx = item.row_index;
@@ -279,7 +270,7 @@ REQUIRED JSON RESPONSE STRUCTURE:
       }
     }
 
-    // Process newly added rows
+    // Process new 2026 courses / rows
     const startNewRowIdx = updatedExcelRows.length;
     const newRowsList = aiResult.new_rows || [];
     for (let i = 0; i < newRowsList.length; i++) {
@@ -291,14 +282,13 @@ REQUIRED JSON RESPONSE STRUCTURE:
       }
     }
 
-    // Soft Yellow Fill (#FFF2CC) for changed cells
+    // Soft yellow fill (#FFF2CC)
     const yellowFill: ExcelJS.Fill = {
       type: "pattern",
       pattern: "solid",
       fgColor: { argb: "FFFFF2CC" },
     };
 
-    // Add rows to worksheet & format
     updatedExcelRows.forEach((rowObj, rIdx) => {
       const addedRow = ws.addRow(rowObj);
       columns.forEach((colKey, cIdx) => {
@@ -317,27 +307,28 @@ REQUIRED JSON RESPONSE STRUCTURE:
       });
     });
 
-    // Auto-fit column widths
     ws.columns.forEach((col) => {
-      let maxLen = 12;
+      let maxLen = 14;
       col.eachCell?.({ includeEmpty: true }, (cell) => {
         const len = cell.value ? String(cell.value).length : 0;
         if (len > maxLen) maxLen = len;
       });
-      col.width = Math.min(maxLen + 4, 40);
+      col.width = Math.min(maxLen + 4, 45);
     });
 
-    // Add Summary Worksheet
+    // Summary sheet
     const summaryWs = outputWb.addWorksheet("Update Summary");
     summaryWs.addRow(["RecordSync Execution Summary"]);
-    summaryWs.addRow(["Original Rows Count", excelRows.length]);
-    summaryWs.addRow(["Updated Existing Rows", updatedRowsList.length]);
-    summaryWs.addRow(["Newly Added Rows", newRowsList.length]);
-    summaryWs.addRow(["Model Used (With Auto-Switch)", modelUsed]);
-    summaryWs.addRow(["API Key Account # Used", keyUsedIndex]);
-    summaryWs.addRow(["AI Reconciliation Notes", aiResult.summary || "No notes."]);
+    summaryWs.addRow(["Total Courses/Rows Processed", excelRows.length]);
+    summaryWs.addRow(["Autofilled & Updated Rows", updatedRowsList.length]);
+    summaryWs.addRow(["Newly Discovered Courses/Rows", newRowsList.length]);
+    summaryWs.addRow(["AI Model Used", modelUsed]);
+    summaryWs.addRow(["API Key Account Used", keyUsedIndex]);
+    if (customPrompt.trim()) {
+      summaryWs.addRow(["Teacher Custom Instructions", customPrompt.trim()]);
+    }
+    summaryWs.addRow(["AI Summary Notes", aiResult.summary || "All records matched and updated."]);
 
-    // Export binary buffer
     const excelBuffer = await outputWb.xlsx.writeBuffer();
 
     return new NextResponse(excelBuffer, {
