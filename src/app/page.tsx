@@ -13,7 +13,12 @@ import {
   RefreshCw,
   Zap,
   MessageSquareText,
-  HelpCircle,
+  ClipboardPaste,
+  ShieldAlert,
+  ChevronDown,
+  ChevronUp,
+  ListOrdered,
+  ExternalLink,
 } from "lucide-react";
 
 const MODEL_OPTIONS = [
@@ -53,12 +58,15 @@ export default function RecordSyncPage() {
   const [apiKeys, setApiKeys] = useState<string>("");
   const [selectedModel, setSelectedModel] = useState<string>("gemini-2.5-flash");
   const [url, setUrl] = useState<string>("");
+  const [directContent, setDirectContent] = useState<string>("");
+  const [showDirectPaste, setShowDirectPaste] = useState<boolean>(false);
   const [customPrompt, setCustomPrompt] = useState<string>("");
   const [file, setFile] = useState<File | null>(null);
 
   const [loading, setLoading] = useState<boolean>(false);
   const [statusStep, setStatusStep] = useState<string>("");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [scraperWarning, setScraperWarning] = useState<string | null>(null);
 
   const [downloadBlobUrl, setDownloadBlobUrl] = useState<string | null>(null);
   const [downloadFileName, setDownloadFileName] = useState<string>("");
@@ -68,6 +76,7 @@ export default function RecordSyncPage() {
     modelUsed: string;
     keyUsed: string;
     notes: string;
+    pagesScraped: string[];
   } | null>(null);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -78,6 +87,7 @@ export default function RecordSyncPage() {
 
   const handleRunUpdate = async () => {
     setErrorMsg(null);
+    setScraperWarning(null);
     setDownloadBlobUrl(null);
     setStats(null);
 
@@ -89,28 +99,29 @@ export default function RecordSyncPage() {
       setErrorMsg("Please upload your Excel file (.xlsx or .xls).");
       return;
     }
-    if (!url.trim() || !url.startsWith("http")) {
-      setErrorMsg("Please enter a valid university URL starting with http:// or https://");
+    if (!url.trim() && !directContent.trim()) {
+      setErrorMsg("Please provide either a university webpage URL or paste the webpage text directly.");
       return;
     }
 
     setLoading(true);
-    setStatusStep("Step 1/3: Extracting University Web Content & Dynamic Tables...");
+    setStatusStep("Step 1/3: Deep Crawling University Root Page & Subpages...");
 
     try {
       const formData = new FormData();
       formData.append("file", file);
       formData.append("url", url);
+      formData.append("directContent", directContent);
       formData.append("apiKeys", apiKeys);
       formData.append("model", selectedModel);
       formData.append("customPrompt", customPrompt);
 
       setTimeout(() => {
-        setStatusStep("Step 2/3: AI Auto-filling Blanks & Matching Records (400 Courses Scale)...");
+        setStatusStep("Step 2/3: Fuzzy Matching Course Codes & Auto-filling Blanks...");
       }, 3000);
 
       setTimeout(() => {
-        setStatusStep("Step 3/3: Highlighting Updated Cells in Soft Yellow & Generating XLSX...");
+        setStatusStep("Step 3/3: Reconciling Outdated Values & Applying Yellow Cell Styling...");
       }, 7000);
 
       const response = await fetch("/api/update-records", {
@@ -135,7 +146,22 @@ export default function RecordSyncPage() {
       const rawNotes = response.headers.get("X-Summary-Notes") || "";
       const notes = rawNotes ? decodeURIComponent(rawNotes) : "Reconciliation completed.";
 
-      setStats({ updatedCount, newCount, modelUsed, keyUsed, notes });
+      const rawWarning = response.headers.get("X-Scraper-Warning") || "";
+      if (rawWarning) {
+        setScraperWarning(decodeURIComponent(rawWarning));
+      }
+
+      let pagesScraped: string[] = [];
+      const rawPages = response.headers.get("X-Pages-Scraped") || "";
+      if (rawPages) {
+        try {
+          pagesScraped = JSON.parse(decodeURIComponent(rawPages));
+        } catch {
+          pagesScraped = [];
+        }
+      }
+
+      setStats({ updatedCount, newCount, modelUsed, keyUsed, notes, pagesScraped });
     } catch (err: any) {
       setErrorMsg(err.message || "An unexpected error occurred during processing.");
     } finally {
@@ -155,9 +181,9 @@ export default function RecordSyncPage() {
             </div>
             <div>
               <h1 className="font-bold text-lg text-white leading-tight flex items-center gap-2">
-                RecordSync <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-blue-500/10 text-blue-400 border border-blue-500/20">2026 Course Edition</span>
+                RecordSync <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-blue-500/10 text-blue-400 border border-blue-500/20">Resilient 2026 Edition</span>
               </h1>
-              <p className="text-xs text-slate-400">Intelligent Academic Excel Updater with Auto-Fill & Custom Prompts</p>
+              <p className="text-xs text-slate-400">Intelligent Academic Excel Updater with Deep Scraping & Direct Bypass</p>
             </div>
           </div>
           <div className="flex items-center gap-3">
@@ -193,8 +219,8 @@ export default function RecordSyncPage() {
                 <Zap className="w-3.5 h-3.5" /> Dual Auto-Switch Failover
               </p>
               <p>
-                • <strong>Key Failover:</strong> If key #1 reaches its quota limit, key #2 is used immediately.<br />
-                • <strong>Model Failover:</strong> If a model's RPM/RPD hits a cap, it auto-switches to the next model (e.g. Flash → Flash-Lite).
+                • <strong>Key Failover:</strong> If key #1 hits quota limit, key #2 is tried instantly.<br />
+                • <strong>Model Failover:</strong> If model RPM/RPD cap is reached, it switches models automatically!
               </p>
             </div>
           </div>
@@ -220,17 +246,6 @@ export default function RecordSyncPage() {
                 {MODEL_OPTIONS.find((m) => m.id === selectedModel)?.desc}
               </p>
             )}
-          </div>
-
-          {/* Quick FAQ / Teacher Course Explainer */}
-          <div className="bg-slate-900/60 border border-slate-800/80 rounded-2xl p-4 text-xs text-slate-400 space-y-2">
-            <span className="font-semibold text-slate-300 flex items-center gap-1.5">
-              <HelpCircle className="w-4 h-4 text-amber-400" /> 400 Courses Processing Note:
-            </span>
-            <p className="leading-relaxed">
-              When processing a university course catalog (e.g., 400 courses in one sheet), RecordSync sends the entire batch to Gemini. 
-              Empty fields (like missing instructor, course description, or prerequisite codes) are automatically looked up from the live link and populated!
-            </p>
           </div>
         </div>
 
@@ -264,7 +279,7 @@ export default function RecordSyncPage() {
                   ) : (
                     <div>
                       <p className="text-sm font-medium text-slate-300">Drag & drop your course/student sheet or browse</p>
-                      <p className="text-xs text-slate-500">Supports up to 400+ course rows with blank or legacy values</p>
+                      <p className="text-xs text-slate-500">Supports up to 400+ course rows with blank or outdated values</p>
                     </div>
                   )}
                 </div>
@@ -273,9 +288,20 @@ export default function RecordSyncPage() {
 
             {/* Input 2: Web Link */}
             <div className="space-y-2">
-              <label className="text-sm font-semibold text-slate-200 flex items-center gap-2">
-                <Globe className="w-4 h-4 text-sky-400" /> 2. Target University Web Link
-              </label>
+              <div className="flex items-center justify-between">
+                <label className="text-sm font-semibold text-slate-200 flex items-center gap-2">
+                  <Globe className="w-4 h-4 text-sky-400" /> 2. Target University Web Link
+                </label>
+                <button
+                  type="button"
+                  onClick={() => setShowDirectPaste(!showDirectPaste)}
+                  className="text-xs text-blue-400 hover:text-blue-300 flex items-center gap-1"
+                >
+                  <ClipboardPaste className="w-3.5 h-3.5" />
+                  <span>{showDirectPaste ? "Hide Direct Paste" : "Behind Login / Protected? Paste Web Text Directly"}</span>
+                  {showDirectPaste ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+                </button>
+              </div>
               <div className="relative">
                 <input
                   type="url"
@@ -287,6 +313,25 @@ export default function RecordSyncPage() {
                 <Globe className="w-4 h-4 text-slate-500 absolute left-3.5 top-3.5" />
               </div>
             </div>
+
+            {/* Direct Paste Accordion (Ultimate Scraper Bypass) */}
+            {showDirectPaste && (
+              <div className="bg-slate-950/80 border border-blue-900/50 rounded-xl p-4 space-y-2">
+                <div className="flex items-center gap-2 text-blue-400 text-xs font-semibold">
+                  <ClipboardPaste className="w-4 h-4" /> 100% Guaranteed Bypass: Direct University Webpage Text / HTML Paste
+                </div>
+                <p className="text-[11px] text-slate-400 leading-relaxed">
+                  If the university portal is behind a student/teacher password login, Cloudflare captcha, or dynamic React tabs, simply open the page in your browser, press <strong>Ctrl + A</strong>, <strong>Ctrl + C</strong>, and paste the text/table content here:
+                </p>
+                <textarea
+                  rows={4}
+                  value={directContent}
+                  onChange={(e) => setDirectContent(e.target.value)}
+                  placeholder="Paste copied university text or raw HTML here..."
+                  className="w-full text-xs bg-slate-900 border border-slate-800 rounded-xl p-3 text-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50 font-mono"
+                />
+              </div>
+            )}
 
             {/* Input 3: Teacher's Custom Prompt Input */}
             <div className="space-y-2">
@@ -300,10 +345,18 @@ export default function RecordSyncPage() {
                 rows={2}
                 value={customPrompt}
                 onChange={(e) => setCustomPrompt(e.target.value)}
-                placeholder="e.g. 'Auto-fill all missing Course Credits and Prerequisites. If a course is discontinued in 2026, set Status to Discontinued.' or 'Only update instructor names and emails.'"
+                placeholder="e.g. 'Autofill all missing Course Credits and Prerequisites. If a course is discontinued in 2026, set Status to Discontinued.' or 'Only update instructor names and emails.'"
                 className="w-full text-xs bg-slate-950 border border-slate-800 rounded-xl p-3 text-slate-200 focus:outline-none focus:ring-2 focus:ring-purple-500/50 resize-none"
               />
             </div>
+
+            {/* Scraper Diagnostic Warning */}
+            {scraperWarning && (
+              <div className="bg-amber-950/80 border border-amber-800 text-amber-300 px-4 py-3 rounded-xl text-xs flex items-center gap-3">
+                <ShieldAlert className="w-5 h-5 text-amber-400 flex-shrink-0" />
+                <span>{scraperWarning} (Tip: If data was missed, use the 'Paste Web Text Directly' option above!)</span>
+              </div>
+            )}
 
             {/* Error Alert */}
             {errorMsg && (
@@ -322,7 +375,7 @@ export default function RecordSyncPage() {
               {loading ? (
                 <>
                   <RefreshCw className="w-5 h-5 animate-spin text-white" />
-                  <span>{statusStep || "Processing 400 Courses & Auto-filling..."}</span>
+                  <span>{statusStep || "Processing Records..."}</span>
                 </>
               ) : (
                 <>
@@ -360,6 +413,33 @@ export default function RecordSyncPage() {
                   <p className="text-xs font-bold text-blue-300 mt-2">Account #{stats.keyUsed}</p>
                 </div>
               </div>
+
+              {/* Scraped Pages List Card */}
+              {stats.pagesScraped && stats.pagesScraped.length > 0 && (
+                <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-4 space-y-2">
+                  <div className="flex items-center gap-2 text-xs font-semibold text-sky-400">
+                    <ListOrdered className="w-4 h-4" />
+                    <span>Pages Scraped ({stats.pagesScraped.length}):</span>
+                  </div>
+                  <ul className="text-[11px] text-slate-300 space-y-1.5 font-mono max-h-40 overflow-y-auto pr-2">
+                    {stats.pagesScraped.map((pageUrl, idx) => (
+                      <li key={idx} className="flex items-center justify-between bg-slate-950 p-2 rounded-lg border border-slate-800/80">
+                        <span className="truncate max-w-md">{pageUrl}</span>
+                        {pageUrl.startsWith("http") && (
+                          <a
+                            href={pageUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-blue-400 hover:text-blue-300 ml-2 flex-shrink-0"
+                          >
+                            <ExternalLink className="w-3.5 h-3.5" />
+                          </a>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
 
               {/* Summary Notes */}
               <div className="bg-slate-900/80 border border-slate-800 rounded-xl p-4 text-xs text-slate-300 space-y-1">
