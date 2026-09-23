@@ -1,36 +1,45 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# RecordSync 2026 - Academic Excel & Web Record Updater
 
-## Getting Started
+RecordSync is a Next.js (App Router) + Tailwind CSS web application built for university teachers to reconcile legacy Excel records (e.g. 2023/2024 data) with fresh 2026 university web data.
 
-First, run the development server:
+---
+
+## 🌟 Key Features
+
+1. **Vercel Native Deployment**
+   - Built on Next.js 14+ (App Router) for zero-configuration, 100% free hosting on Vercel.
+
+2. **Dual Failover Strategy (Zero Quota Exhaustion)**
+   - **Multi-API Key Failover**: Input multiple free Google AI Studio API keys (comma-separated). If Key #1 hits rate limits (HTTP 429), it automatically switches to Key #2!
+   - **Automatic Model Auto-Switch**: If a specific model reaches its daily or minute limit (e.g., `gemini-2.5-flash` at 20 RPD), the system automatically switches models in real-time (`gemini-3.5-flash-lite` -> `gemini-3.1-flash-lite` -> `gemini-3.5-flash` -> `gemini-3.7-flash`).
+
+3. **Dynamic University Web Scraping API Route**
+   - Cleans HTML text, removes navigation metadata, and extracts structured tables dynamically.
+
+4. **Excel Visual Cell Highlighting (`#FFF2CC`)**
+   - Powered by `exceljs`. Applies soft yellow background highlights to changed or newly added cells.
+
+---
+
+## 🚀 How to Run Locally
 
 ```bash
+# 1. Navigate to project directory
+cd recordsync
+
+# 2. Install dependencies
+npm install
+
+# 3. Start local development server
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
+Open `http://localhost:3000` in your browser.
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+---
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## 🌐 How to Deploy to Vercel (100% Free)
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
-
-## Learn More
-
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+1. Push the `recordsync` project folder to your GitHub repository.
+2. Sign in to [Vercel](https://vercel.com/) and click **Add New Project**.
+3. Import your repository. Vercel automatically detects Next.js.
+4. Click **Deploy**. Done!
