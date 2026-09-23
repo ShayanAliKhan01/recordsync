@@ -7,7 +7,6 @@ import { GoogleGenAI } from "@google/genai";
 export const maxDuration = 60;
 export const dynamic = "force-dynamic";
 
-// Model auto-switch priority list
 const FALLBACK_MODEL_CHAIN = [
   "gemini-2.5-flash",
   "gemini-3.5-flash-lite",
@@ -44,7 +43,7 @@ function extractPageData(htmlText: string, sourceUrl: string): { tables: string[
             !resolved.includes("#") &&
             !resolved.match(/\.(pdf|jpg|jpeg|png|zip|doc|docx|mp4|svg)$/i)
           ) {
-            const isRelevant = /course|catalog|syllabus|schedule|curriculum|department|faculty|degree|program|result|timetable|grade/i.test(resolved);
+            const isRelevant = /course|program|catalog|syllabus|schedule|curriculum|department|faculty|degree|admission|fee/i.test(resolved);
             if (isRelevant && !subLinks.includes(resolved) && resolved !== sourceUrl) {
               subLinks.push(resolved);
             }
@@ -81,11 +80,15 @@ function extractPageData(htmlText: string, sourceUrl: string): { tables: string[
 }
 
 /**
- * Deep crawler that tracks and lists all crawled pages
+ * Intelligent Crawler:
+ * 1. Crawls root URL
+ * 2. Reads direct in-row course links (e.g. course_detail_web_link, course_fee_web_link) directly from the Excel sheet!
+ * 3. Crawls priority sublinks up to maxPages limit.
  */
-async function deepCrawlUniversitySite(
+async function crawlUniversityPages(
   rootUrl: string,
-  maxSubpages = 6
+  inSheetUrls: string[],
+  maxPages = 20
 ): Promise<{ content: string; warning?: string; pagesScraped: string[] }> {
   const visited = new Set<string>();
   const pagesScraped: string[] = [];
@@ -93,63 +96,63 @@ async function deepCrawlUniversitySite(
   const textChunks: string[] = [];
   let antiBotDetected = false;
 
-  try {
-    const res = await fetch(rootUrl, { headers: STANDARD_HEADERS, cache: "no-store" });
-    if (!res.ok) {
-      return {
-        content: `Error fetching URL (HTTP ${res.status} ${res.statusText}).`,
-        warning: `HTTP ${res.status}: The university site may block automated cloud scrapers or require login.`,
-        pagesScraped: [rootUrl],
-      };
-    }
-    const html = await res.text();
-    visited.add(rootUrl);
-    pagesScraped.push(rootUrl);
+  // 1. Fetch root page if provided
+  if (rootUrl && rootUrl.startsWith("http")) {
+    try {
+      const res = await fetch(rootUrl, { headers: STANDARD_HEADERS, cache: "no-store" });
+      if (res.ok) {
+        const html = await res.text();
+        visited.add(rootUrl);
+        pagesScraped.push(rootUrl);
 
-    if (
-      html.includes("cf-browser-verification") ||
-      html.includes("Access Denied") ||
-      html.includes("Checking your browser") ||
-      html.includes("Cloudflare")
-    ) {
-      antiBotDetected = true;
-    }
+        if (html.includes("cf-browser-verification") || html.includes("Access Denied") || html.includes("Cloudflare")) {
+          antiBotDetected = true;
+        }
 
-    const { tables, text, subLinks } = extractPageData(html, rootUrl);
-    allTables.push(...tables);
-    textChunks.push(`=== ROOT PAGE (${rootUrl}) ===\n${text.slice(0, 15000)}`);
+        const { tables, text, subLinks } = extractPageData(html, rootUrl);
+        allTables.push(...tables);
+        textChunks.push(`=== ROOT (${rootUrl}) ===\n${text.slice(0, 10000)}`);
 
-    const targetsToCrawl = subLinks.slice(0, maxSubpages);
-    if (targetsToCrawl.length > 0) {
-      const crawlPromises = targetsToCrawl.map(async (subUrl) => {
-        if (visited.has(subUrl)) return;
-        visited.add(subUrl);
-        pagesScraped.push(subUrl);
-        try {
-          const subRes = await fetch(subUrl, { headers: STANDARD_HEADERS, cache: "no-store" });
-          if (subRes.ok) {
-            const subHtml = await subRes.text();
-            const extracted = extractPageData(subHtml, subUrl);
-            allTables.push(...extracted.tables);
-            textChunks.push(`=== SUBPAGE (${subUrl}) ===\n${extracted.text.slice(0, 10000)}`);
+        // Enqueue high-priority sublinks from root
+        for (const link of subLinks) {
+          if (!inSheetUrls.includes(link) && pagesScraped.length < maxPages) {
+            inSheetUrls.push(link);
           }
-        } catch {}
-      });
-      await Promise.allSettled(crawlPromises);
+        }
+      }
+    } catch (e: any) {
+      console.warn("Root fetch error:", e?.message);
     }
-  } catch (err: any) {
-    return {
-      content: `Failed to scrape university URL: ${err?.message}`,
-      warning: `Scraper error: ${err?.message}`,
-      pagesScraped: [rootUrl],
-    };
   }
 
-  const combined = `=== DEEP SCRAPED TABLES ===\n${allTables.join("\n\n")}\n\n=== MAIN CONTENT ===\n${textChunks.join("\n\n")}`;
+  // 2. Fetch specific course detail & fee pages (direct in-sheet links)
+  const linksToCrawl = inSheetUrls.filter((u) => u && u.startsWith("http") && !visited.has(u)).slice(0, maxPages);
+
+  const crawlTasks = linksToCrawl.map(async (linkUrl) => {
+    if (visited.has(linkUrl)) return;
+    visited.add(linkUrl);
+    pagesScraped.push(linkUrl);
+
+    try {
+      const res = await fetch(linkUrl, { headers: STANDARD_HEADERS, cache: "no-store" });
+      if (res.ok) {
+        const html = await res.text();
+        const extracted = extractPageData(html, linkUrl);
+        allTables.push(...extracted.tables);
+        textChunks.push(`=== PAGE: ${linkUrl} ===\n${extracted.text.slice(0, 8000)}`);
+      }
+    } catch (err: any) {
+      console.warn(`Error crawling ${linkUrl}:`, err?.message);
+    }
+  });
+
+  await Promise.allSettled(crawlTasks);
+
+  const combined = `=== SCRAPED TABLES ===\n${allTables.join("\n\n")}\n\n=== SCRAPED WEBPAGES ===\n${textChunks.join("\n\n")}`;
 
   return {
     content: combined,
-    warning: antiBotDetected ? "Cloudflare / Anti-bot challenge detected on target website." : undefined,
+    warning: antiBotDetected ? "Cloudflare / Anti-bot verification detected on site." : undefined,
     pagesScraped,
   };
 }
@@ -213,21 +216,29 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "Missing required Excel file or API key(s)." }, { status: 400 });
     }
 
-    if (!url.trim() && !rawDirectContent.trim()) {
-      return NextResponse.json({ error: "Please provide either a university URL or paste webpage text directly." }, { status: 400 });
-    }
-
     const apiKeys = apiKeysRaw.split(",").map((k) => k.trim()).filter(Boolean);
     if (apiKeys.length === 0) {
       return NextResponse.json({ error: "At least one valid Google Gemini API key must be provided." }, { status: 400 });
     }
 
-    // Step A: Parse uploaded Excel file
+    // Step A: Parse uploaded Excel file buffer
     const arrayBuffer = await file.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
     const workbook = XLSX.read(buffer, { type: "buffer" });
-    const firstSheetName = workbook.SheetNames[0];
-    const worksheet = workbook.Sheets[firstSheetName];
+
+    // FIX 1: Target the actual DATA sheet (e.g. 'Data', 'Records', or longest data sheet) instead of sheet 0 ('What_Was_Done')
+    let targetSheetName = workbook.SheetNames[0];
+    let maxRowCount = 0;
+    for (const name of workbook.SheetNames) {
+      const s = workbook.Sheets[name];
+      const rows = XLSX.utils.sheet_to_json(s, { defval: "" });
+      if (rows.length > maxRowCount) {
+        maxRowCount = rows.length;
+        targetSheetName = name;
+      }
+    }
+
+    const worksheet = workbook.Sheets[targetSheetName];
     const rawExcelRows: any[] = XLSX.utils.sheet_to_json(worksheet, { defval: "" });
 
     if (rawExcelRows.length === 0) {
@@ -236,80 +247,80 @@ export async function POST(req: NextRequest) {
 
     const originalColumns = Object.keys(rawExcelRows[0] || {});
 
-    // Step B: Resolve Web Content (Direct Content or Deep Web Scraper)
+    // FIX 2: Harvest in-sheet web links (like course_detail_web_link, course_fee_web_link)
+    const inSheetUrls: string[] = [];
+    rawExcelRows.forEach((row) => {
+      Object.entries(row).forEach(([colKey, val]) => {
+        const strVal = String(val).trim();
+        if (strVal.startsWith("http://") || strVal.startsWith("https://")) {
+          if (!inSheetUrls.includes(strVal)) {
+            inSheetUrls.push(strVal);
+          }
+        }
+      });
+    });
+
+    // Step B: Crawl targeted university pages
     let webText = "";
     let scraperWarning: string | undefined = undefined;
     let pagesScraped: string[] = [];
 
     if (rawDirectContent.trim().length > 30) {
-      webText = `=== USER PROVIDED DIRECT WEBPAGE TEXT / HTML (AUTHENTIC SOURCE) ===\n${rawDirectContent.trim()}`;
+      webText = `=== USER DIRECT PASTED CONTENT ===\n${rawDirectContent.trim()}`;
       pagesScraped = ["Direct User Webpage Text / HTML (Bypassed Scraper)"];
-    } else if (url.trim().startsWith("http")) {
-      const crawlResult = await deepCrawlUniversitySite(url.trim(), 7);
+    } else {
+      const crawlResult = await crawlUniversityPages(url.trim(), inSheetUrls, 25);
       webText = crawlResult.content;
       scraperWarning = crawlResult.warning;
       pagesScraped = crawlResult.pagesScraped;
-    } else {
-      return NextResponse.json({ error: "Invalid URL provided and no direct content pasted." }, { status: 400 });
     }
 
-    // Step C: Build Resilient Reconciliation Prompt
+    // Step C: Build AI Reconciliation Prompt
     const systemInstruction = `You are a world-class academic database administrator and university registrar AI.
-Your mission is to rigorously reconcile, update, and autofill course, student, faculty, and marksheet records.
-RULES:
-1. FUZZY IDENTIFIER MATCHING: Match rows by course codes or titles flexibly (e.g. 'CS101' matches 'CS 101', 'CS-101', 'COMP101').
-2. UPDATE OUTDATED INFORMATION: Overwrite any outdated fields with 2026 data found on the web content.
-3. AUTOFILL BLANK / MISSING FIELDS: If an Excel cell is empty, blank (""), null, or missing, look up that record in the web content and populate it.
-4. KEY PRESERVATION: Keep exact column keys as provided: ${JSON.stringify(originalColumns)}.
-5. DO NOT RETURN AN UNMODIFIED SHEET IF DATA EXISTS: If the web content contains matching courses/grades, you MUST extract and update them.`;
+You are reconciling the main course catalog sheet ('${targetSheetName}') against live university webpage data.
+CRITICAL RULES:
+1. AUTO-FILL: Fill in all empty fields, 'tbc' placeholders, or missing details (e.g., overview, structure, career_prospects, fee_per_year, entry_requirements) using the scraped course/program details.
+2. UPDATE: If course names, fees, duration, or titles have updated for 2026, overwrite them with current values.
+3. FUZZY MATCH: Match rows by course_name, specialization, campus, or course_detail_web_link.
+4. EXACT COLUMNS: Maintain exact column names: ${JSON.stringify(originalColumns)}.`;
 
     const prompt = `
-${customPrompt.trim() ? `TEACHER'S SPECIAL INSTRUCTION:\n"${customPrompt.trim()}"\n` : ""}
-ORIGINAL EXCEL HEADERS: ${JSON.stringify(originalColumns)}
-TOTAL ROWS IN EXCEL: ${rawExcelRows.length}
+${customPrompt.trim() ? `TEACHER'S INSTRUCTION:\n"${customPrompt.trim()}"\n` : ""}
+SHEET NAME BEING UPDATED: "${targetSheetName}"
+ORIGINAL COLUMNS: ${JSON.stringify(originalColumns)}
+TOTAL RECORDS IN SHEET: ${rawExcelRows.length}
 
-EXCEL ROWS TO RECONCILE (WITH ROW INDEX):
+EXCEL RECORDS TO RECONCILE (WITH ROW INDEX):
 ${JSON.stringify(
   rawExcelRows.slice(0, 450).map((r, idx) => ({ _row_index: idx, ...r })),
   null,
   1
 )}
 
-WEBPAGE DATA (COURSES, CATALOGS, RESULTS, TABLES):
-${webText.slice(0, 80000)}
+LIVE UNIVERSITY WEBPAGE DATA (INCLUDING SPECIFIC PROGRAM PAGES & TABLES):
+${webText.slice(0, 85000)}
 
 TASK:
-- Compare every row with the webpage content.
-- For each updated or auto-filled row, specify:
-  * "row_index": The exact integer _row_index from the row object above.
-  * "identifier": The course code or name matched.
-  * "updated_data": An object containing the columns and their updated/populated values.
-  * "changed_columns": Array of column names that were updated or autofilled.
-  * "reason": Why it changed.
-- If new courses exist on the web that are missing from Excel, include them in "new_rows".
+- For every row where fields were empty, 'tbc', or outdated, extract the correct information from the scraped pages and populate/update it.
+- Output JSON specifying row_index, identifier, updated_data, and changed_columns.
 
-OUTPUT STRICT JSON SCHEMA:
+JSON SCHEMA:
 {
   "updated_rows": [
     {
       "row_index": 0,
-      "identifier": "CS-101",
-      "updated_data": { "Course Title": "Intro to AI", "Credits": "3" },
-      "changed_columns": ["Course Title", "Credits"],
-      "reason": "Updated outdated title and filled missing credits"
+      "identifier": "Advanced Diploma in English",
+      "updated_data": { "overview ": "Comprehensive overview text...", "fee_per_year": 45000 },
+      "changed_columns": ["overview ", "fee_per_year"],
+      "reason": "Populated overview and updated fee from official program page"
     }
   ],
-  "new_rows": [
-    {
-      "data": { "Course Code": "CS-405", "Course Title": "Cloud Computing" },
-      "reason": "New 2026 course catalog entry"
-    }
-  ],
-  "summary": "Summary of updates made."
+  "new_rows": [],
+  "summary": "Summary of populated and updated fields."
 }
 `;
 
-    // Step D: AI Execution
+    // Step D: Call Gemini with failover
     const { text: rawAiResponse, modelUsed, keyUsedIndex } = await callGeminiWithFullFailover(
       apiKeys,
       selectedModel,
@@ -325,7 +336,7 @@ OUTPUT STRICT JSON SCHEMA:
       if (match) {
         aiResult = JSON.parse(match[0]);
       } else {
-        throw new Error("Unable to parse AI JSON response.");
+        throw new Error("Unable to parse AI response into JSON.");
       }
     }
 
@@ -379,6 +390,7 @@ OUTPUT STRICT JSON SCHEMA:
       }
     }
 
+    // Process new rows
     const startNewRowIdx = updatedExcelRows.length;
     const newRowsList = aiResult.new_rows || [];
     for (let i = 0; i < newRowsList.length; i++) {
@@ -404,10 +416,21 @@ OUTPUT STRICT JSON SCHEMA:
       });
     }
 
-    // Step F: Build Styled Excel Workbook
+    // Step F: Build Styled Excel Workbook preserving all original sheets
     const outputWb = new ExcelJS.Workbook();
-    const ws = outputWb.addWorksheet("2026 Updated Records");
 
+    // Preserve any existing notes sheet (e.g. 'What_Was_Done')
+    for (const sName of workbook.SheetNames) {
+      if (sName !== targetSheetName) {
+        const origOtherSheet = workbook.Sheets[sName];
+        const otherRows: any[] = XLSX.utils.sheet_to_json(origOtherSheet, { header: 1 });
+        const newOtherWs = outputWb.addWorksheet(sName);
+        otherRows.forEach((r) => newOtherWs.addRow(r));
+      }
+    }
+
+    // Add main updated Data worksheet
+    const ws = outputWb.addWorksheet(targetSheetName);
     ws.columns = originalColumns.map((col) => ({ header: col, key: col, width: 22 }));
 
     const headerRow = ws.getRow(1);
@@ -454,9 +477,10 @@ OUTPUT STRICT JSON SCHEMA:
       col.width = Math.min(maxLen + 4, 45);
     });
 
-    // Summary tab
+    // Add Summary Sheet
     const summaryWs = outputWb.addWorksheet("Update Summary");
     summaryWs.addRow(["RecordSync Execution Summary"]);
+    summaryWs.addRow(["Sheet Updated", targetSheetName]);
     summaryWs.addRow(["Total Courses/Rows Processed", rawExcelRows.length]);
     summaryWs.addRow(["Autofilled & Updated Rows", updatedRowsList.length]);
     summaryWs.addRow(["Newly Discovered Courses/Rows", newRowsList.length]);
