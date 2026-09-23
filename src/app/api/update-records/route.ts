@@ -16,24 +16,54 @@ const FALLBACK_MODEL_CHAIN = [
   "gemini-3.7-flash",
 ];
 
-async function scrapeUniversityWebpage(url: string): Promise<string> {
-  const headers = {
-    "User-Agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    Accept:
-      "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-  };
+const STANDARD_HEADERS = {
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  Accept:
+    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+  "Accept-Language": "en-US,en;q=0.9",
+};
 
-  const response = await fetch(url, { headers, cache: "no-store" });
-  if (!response.ok) {
-    throw new Error(`Failed to fetch university URL. Status: ${response.status} ${response.statusText}`);
-  }
-
-  const htmlText = await response.text();
+/**
+ * Clean HTML and extract text + structured tables
+ */
+function extractPageData(htmlText: string, sourceUrl: string): { tables: string[]; text: string; subLinks: string[] } {
   const $ = cheerio.load(htmlText);
 
+  // Extract internal sublinks before removing navigation elements
+  const subLinks: string[] = [];
+  try {
+    const parsedOrigin = new URL(sourceUrl).origin;
+    $("a[href]").each((_, el) => {
+      const href = $(el).attr("href");
+      if (href) {
+        try {
+          const resolved = new URL(href, sourceUrl).toString();
+          // Filter to same domain and relevant course/academic subpages
+          if (
+            resolved.startsWith(parsedOrigin) &&
+            !resolved.includes("#") &&
+            !resolved.match(/\.(pdf|jpg|jpeg|png|zip|doc|docx|mp4|svg)$/i)
+          ) {
+            // Priority keywords in URL
+            const isRelevant = /course|catalog|syllabus|schedule|curriculum|department|faculty|degree|program|result|timetable|grade/i.test(resolved);
+            if (isRelevant && !subLinks.includes(resolved) && resolved !== sourceUrl) {
+              subLinks.push(resolved);
+            }
+          }
+        } catch {
+          // ignore malformed URLs
+        }
+      }
+    });
+  } catch {
+    // ignore
+  }
+
+  // Remove clutter
   $("script, style, noscript, nav, footer, iframe, header, svg").remove();
 
+  // Extract structured tables
   const tables: string[] = [];
   $("table").each((idx, el) => {
     const rows: string[] = [];
@@ -47,21 +77,72 @@ async function scrapeUniversityWebpage(url: string): Promise<string> {
             const txt = $(td).text().replace(/\s+/g, " ").trim();
             if (txt) cols.push(txt);
           });
-        if (cols.length > 0) {
-          rows.push(cols.join(" | "));
-        }
+        if (cols.length > 0) rows.push(cols.join(" | "));
       });
     if (rows.length > 0) {
-      tables.push(`--- UNIVERSITY TABLE ${idx + 1} ---\n` + rows.join("\n"));
+      tables.push(`[TABLE ${idx + 1} from ${sourceUrl}]\n` + rows.join("\n"));
     }
   });
 
-  const bodyText = $("body").text().replace(/\s+/g, " ").trim();
-  return `=== EXTRACTED WEBPAGE TABLES ===\n${tables.join(
-    "\n\n"
-  )}\n\n=== MAIN WEBPAGE TEXT ===\n${bodyText.slice(0, 45000)}`;
+  const text = $("body").text().replace(/\s+/g, " ").trim();
+  return { tables, text, subLinks };
 }
 
+/**
+ * DEEP CRAWLER: Crawls root page + internal subpages/tabs where course data is hidden
+ */
+async function deepCrawlUniversitySite(rootUrl: string, maxSubpages = 6): Promise<string> {
+  const visited = new Set<string>();
+  const allTables: string[] = [];
+  const textChunks: string[] = [];
+
+  // Step 1: Fetch root page
+  try {
+    const res = await fetch(rootUrl, { headers: STANDARD_HEADERS, cache: "no-store" });
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status} ${res.statusText}`);
+    }
+    const html = await res.text();
+    visited.add(rootUrl);
+
+    const { tables, text, subLinks } = extractPageData(html, rootUrl);
+    allTables.push(...tables);
+    textChunks.push(`=== ROOT PAGE (${rootUrl}) ===\n${text.slice(0, 15000)}`);
+
+    // Step 2: Concurrently crawl inside pages (up to maxSubpages)
+    const targetsToCrawl = subLinks.slice(0, maxSubpages);
+    if (targetsToCrawl.length > 0) {
+      const crawlPromises = targetsToCrawl.map(async (subUrl) => {
+        if (visited.has(subUrl)) return;
+        visited.add(subUrl);
+        try {
+          const subRes = await fetch(subUrl, { headers: STANDARD_HEADERS, cache: "no-store" });
+          if (subRes.ok) {
+            const subHtml = await subRes.text();
+            const extracted = extractPageData(subHtml, subUrl);
+            allTables.push(...extracted.tables);
+            textChunks.push(`=== SUBPAGE (${subUrl}) ===\n${extracted.text.slice(0, 10000)}`);
+          }
+        } catch (e: any) {
+          console.warn(`Failed crawling subpage ${subUrl}:`, e?.message);
+        }
+      });
+
+      await Promise.allSettled(crawlPromises);
+    }
+  } catch (err: any) {
+    throw new Error(`Failed to crawl university URL ${rootUrl}: ${err?.message}`);
+  }
+
+  const combinedTables = allTables.join("\n\n");
+  const combinedText = textChunks.join("\n\n");
+
+  return `=== DEEP SCRAPED TABLES ACROSS ALL PAGES ===\n${combinedTables}\n\n=== DEEP SCRAPED CONTENT (ROOT + SUBPAGES) ===\n${combinedText}`;
+}
+
+/**
+ * Multi-API Key & Model Fallback Call
+ */
 async function callGeminiWithFullFailover(
   apiKeys: string[],
   initialModel: string,
@@ -100,7 +181,7 @@ async function callGeminiWithFullFailover(
         }
       } catch (err: any) {
         console.warn(
-          `Key #${keyIdx + 1} Model ${currentModel} failed: ${err?.message || err}. Trying next fallback...`
+          `Key #${keyIdx + 1} Model ${currentModel} error: ${err?.message || err}. Trying next fallback...`
         );
         lastError = err;
       }
@@ -155,62 +236,62 @@ export async function POST(req: NextRequest) {
 
     const columns = Object.keys(excelRows[0] || {});
 
-    // Step B: Scrape University Webpage
-    const webText = await scrapeUniversityWebpage(url);
+    // Step B: Deep Crawl Root + Subpages (extracts data hidden in tabs/sublinks)
+    const webText = await deepCrawlUniversitySite(url, 7);
 
-    // Step C: Build Intelligent Prompt (Handling Batching, Auto-fill, and Teacher's Custom Instructions)
-    const systemInstruction = `You are an expert university registrar AI assistant and academic database administrator.
-Your task is to reconcile, update, and autofill course/student/faculty records from legacy Excel sheets with live university webpage data.
-CRITICAL RULES:
-1. AUTO-FILL: If an Excel row has empty, missing, or 'N/A' fields (e.g. course title, credit hours, instructor, department, room, prerequisite, 2026 grade), inspect the scraped web page data and AUTO-FILL those blank fields with correct information.
-2. UPDATE: If existing fields have changed in 2026 (e.g. course code changed from CS-101 to CS-1101, or updated grade/status), update the field.
-3. TEACHER'S CUSTOM INSTRUCTION: If the teacher gave custom instructions, obey them strictly.
-4. NEW RECORDS: If the webpage contains new courses or student records not present in the Excel sheet, append them under new_rows.
-5. PRESERVE COLUMNS: Keep exact column keys: ${JSON.stringify(columns)}.`;
+    // Step C: AI Reconciliation Prompt
+    const systemInstruction = `You are an expert university registrar AI assistant and academic database updater.
+Your goal is to thoroughly reconcile, update, and autofill course/student/faculty records from legacy Excel sheets with live university webpage data gathered from the root portal and all linked subpages.
+CRITICAL MANDATES:
+1. UPDATE OUTDATED INFORMATION: If a course title, instructor, credit hour, code, grade, or status has changed or has a 2026 update anywhere across the scraped pages, UPDATE IT.
+2. AUTOFILL MISSING / BLANK DATA: For every cell that is blank (""), null, or missing, find the matching course/record in the scraped text or tables and fill it in.
+3. FUZZY & FLEXIBLE MATCHING: University websites often format course codes with or without hyphens (e.g., 'CS101', 'CS 101', 'CS-101', 'COMP 101'). Match them intelligently!
+4. NEW RECORDS: Add new 2026 courses or student records under 'new_rows'.
+5. TEACHER'S CUSTOM INSTRUCTIONS: Obey any specific user prompt strictly.
+6. PRESERVE COLUMNS: Retain exact column headers: ${JSON.stringify(columns)}.`;
 
     const teacherInstructionSection = customPrompt.trim()
-      ? `TEACHER'S UNIQUE CUSTOM INSTRUCTIONS (PRIORITY):\n"${customPrompt.trim()}"\n`
+      ? `TEACHER'S UNIQUE INSTRUCTION (HIGHEST PRIORITY):\n"${customPrompt.trim()}"\n`
       : "";
 
-    // Support processing large sheets (up to 400 course rows) by passing compact row data
     const prompt = `
 ${teacherInstructionSection}
-ORIGINAL EXCEL COLUMNS: ${JSON.stringify(columns)}
-TOTAL ROWS IN EXCEL: ${excelRows.length}
+ORIGINAL EXCEL HEADERS: ${JSON.stringify(columns)}
+TOTAL ROWS IN EXCEL SHEET: ${excelRows.length}
 
-EXCEL ROWS TO RECONCILE (JSON):
+EXCEL ROWS TO RECONCILE & UPDATE (JSON):
 ${JSON.stringify(excelRows.slice(0, 450), null, 1)}
 
-LIVE SCRAPED UNIVERSITY WEBPAGE CONTENT:
-${webText}
+DEEP-SCRAPED UNIVERSITY WEBPAGE DATA (INCLUDING SUBPAGES & TABLES):
+${webText.slice(0, 75000)}
 
 INSTRUCTIONS:
-1. Compare each row (course, student, faculty, or code) against the live university webpage.
-2. AUTO-FILL BLANKS: For any row where one or more columns are blank, empty (""), null, or missing, look up that course/entity on the webpage and fill in the missing data.
-3. Mark updated/autofilled column names in 'changed_columns'.
-4. If there are new courses or records on the webpage not in the Excel, include them in 'new_rows'.
+1. Search all scraped tables and subpage texts to find corresponding entries for each row.
+2. Update any outdated values (e.g. 2026 credits, codes, instructors, room numbers, results).
+3. Fill any empty or missing fields with data found on the portal.
+4. If a row is modified or populated, list the row index in 'updated_rows', include the updated row data, and list which column names changed.
 
-REQUIRED JSON RESPONSE STRUCTURE:
+REQUIRED JSON FORMAT:
 {
   "updated_rows": [
     {
       "row_index": 0,
-      "updated_data": { "CourseCode": "CS101", "CourseTitle": "Intro to AI", "Credits": "3" },
+      "updated_data": { "CourseCode": "CS101", "CourseTitle": "Introduction to AI", "Credits": "3" },
       "changed_columns": ["CourseTitle", "Credits"],
-      "reason": "Autofilled missing Course Title and updated credits from university portal"
+      "reason": "Autofilled title and updated credits from subpage catalog table"
     }
   ],
   "new_rows": [
     {
-      "data": { "CourseCode": "CS401", "CourseTitle": "Advanced Machine Learning" },
-      "reason": "New 2026 course catalog entry"
+      "data": { "CourseCode": "CS499", "CourseTitle": "Senior Capstone Project" },
+      "reason": "Newly introduced 2026 course found in department curriculum subpage"
     }
   ],
-  "summary": "2-sentence executive summary of autofilled and updated courses."
+  "summary": "Detailed summary of updated and autofilled courses found across university pages."
 }
 `;
 
-    // Step D: Execute AI reasoning with dual failover
+    // Step D: Execute AI reasoning
     const { text: rawAiResponse, modelUsed, keyUsedIndex } = await callGeminiWithFullFailover(
       apiKeys,
       selectedModel,
@@ -250,7 +331,6 @@ REQUIRED JSON RESPONSE STRUCTURE:
     const updatedExcelRows = [...excelRows];
     const modifiedCellSet = new Set<string>();
 
-    // Apply updates and autofills
     const updatedRowsList = aiResult.updated_rows || [];
     for (const item of updatedRowsList) {
       const rIdx = item.row_index;
@@ -270,7 +350,6 @@ REQUIRED JSON RESPONSE STRUCTURE:
       }
     }
 
-    // Process new 2026 courses / rows
     const startNewRowIdx = updatedExcelRows.length;
     const newRowsList = aiResult.new_rows || [];
     for (let i = 0; i < newRowsList.length; i++) {
@@ -282,7 +361,6 @@ REQUIRED JSON RESPONSE STRUCTURE:
       }
     }
 
-    // Soft yellow fill (#FFF2CC)
     const yellowFill: ExcelJS.Fill = {
       type: "pattern",
       pattern: "solid",
@@ -316,7 +394,6 @@ REQUIRED JSON RESPONSE STRUCTURE:
       col.width = Math.min(maxLen + 4, 45);
     });
 
-    // Summary sheet
     const summaryWs = outputWb.addWorksheet("Update Summary");
     summaryWs.addRow(["RecordSync Execution Summary"]);
     summaryWs.addRow(["Total Courses/Rows Processed", excelRows.length]);
