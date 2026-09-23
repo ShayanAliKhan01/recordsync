@@ -27,32 +27,8 @@ function normalizeKey(str: string): string {
   return str.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
-function extractPageData(htmlText: string, sourceUrl: string): { tables: string[]; text: string; subLinks: string[] } {
+function extractCleanPageText(htmlText: string): string {
   const $ = cheerio.load(htmlText);
-  const subLinks: string[] = [];
-
-  try {
-    const parsedOrigin = new URL(sourceUrl).origin;
-    $("a[href]").each((_, el) => {
-      const href = $(el).attr("href");
-      if (href) {
-        try {
-          const resolved = new URL(href, sourceUrl).toString();
-          if (
-            resolved.startsWith(parsedOrigin) &&
-            !resolved.includes("#") &&
-            !resolved.match(/\.(pdf|jpg|jpeg|png|zip|doc|docx|mp4|svg)$/i)
-          ) {
-            const isRelevant = /course|program|catalog|syllabus|schedule|curriculum|department|faculty|degree|admission|fee/i.test(resolved);
-            if (isRelevant && !subLinks.includes(resolved) && resolved !== sourceUrl) {
-              subLinks.push(resolved);
-            }
-          }
-        } catch {}
-      }
-    });
-  } catch {}
-
   $("script, style, noscript, nav, footer, iframe, header, svg").remove();
 
   const tables: string[] = [];
@@ -70,114 +46,43 @@ function extractPageData(htmlText: string, sourceUrl: string): { tables: string[
           });
         if (cols.length > 0) rows.push(cols.join(" | "));
       });
-    if (rows.length > 0) {
-      tables.push(`[TABLE ${idx + 1} from ${sourceUrl}]\n` + rows.join("\n"));
-    }
+    if (rows.length > 0) tables.push(rows.join("\n"));
   });
 
-  const text = $("body").text().replace(/\s+/g, " ").trim();
-  return { tables, text, subLinks };
+  const bodyText = $("body").text().replace(/\s+/g, " ").trim();
+  return (tables.length > 0 ? `[TABLES]\n${tables.join("\n\n")}\n\n` : "") + bodyText;
 }
 
-/**
- * Intelligent Crawler:
- * 1. Crawls root URL
- * 2. Reads direct in-row course links (e.g. course_detail_web_link, course_fee_web_link) directly from the Excel sheet!
- * 3. Crawls priority sublinks up to maxPages limit.
- */
-async function crawlUniversityPages(
-  rootUrl: string,
-  inSheetUrls: string[],
-  maxPages = 20
-): Promise<{ content: string; warning?: string; pagesScraped: string[] }> {
-  const visited = new Set<string>();
-  const pagesScraped: string[] = [];
-  const allTables: string[] = [];
-  const textChunks: string[] = [];
-  let antiBotDetected = false;
-
-  // 1. Fetch root page if provided
-  if (rootUrl && rootUrl.startsWith("http")) {
-    try {
-      const res = await fetch(rootUrl, { headers: STANDARD_HEADERS, cache: "no-store" });
-      if (res.ok) {
-        const html = await res.text();
-        visited.add(rootUrl);
-        pagesScraped.push(rootUrl);
-
-        if (html.includes("cf-browser-verification") || html.includes("Access Denied") || html.includes("Cloudflare")) {
-          antiBotDetected = true;
-        }
-
-        const { tables, text, subLinks } = extractPageData(html, rootUrl);
-        allTables.push(...tables);
-        textChunks.push(`=== ROOT (${rootUrl}) ===\n${text.slice(0, 10000)}`);
-
-        // Enqueue high-priority sublinks from root
-        for (const link of subLinks) {
-          if (!inSheetUrls.includes(link) && pagesScraped.length < maxPages) {
-            inSheetUrls.push(link);
-          }
-        }
-      }
-    } catch (e: any) {
-      console.warn("Root fetch error:", e?.message);
-    }
+async function fetchUrlContent(url: string): Promise<string> {
+  try {
+    const res = await fetch(url, { headers: STANDARD_HEADERS, cache: "no-store" });
+    if (!res.ok) return "";
+    const html = await res.text();
+    return extractCleanPageText(html);
+  } catch {
+    return "";
   }
-
-  // 2. Fetch specific course detail & fee pages (direct in-sheet links)
-  const linksToCrawl = inSheetUrls.filter((u) => u && u.startsWith("http") && !visited.has(u)).slice(0, maxPages);
-
-  const crawlTasks = linksToCrawl.map(async (linkUrl) => {
-    if (visited.has(linkUrl)) return;
-    visited.add(linkUrl);
-    pagesScraped.push(linkUrl);
-
-    try {
-      const res = await fetch(linkUrl, { headers: STANDARD_HEADERS, cache: "no-store" });
-      if (res.ok) {
-        const html = await res.text();
-        const extracted = extractPageData(html, linkUrl);
-        allTables.push(...extracted.tables);
-        textChunks.push(`=== PAGE: ${linkUrl} ===\n${extracted.text.slice(0, 8000)}`);
-      }
-    } catch (err: any) {
-      console.warn(`Error crawling ${linkUrl}:`, err?.message);
-    }
-  });
-
-  await Promise.allSettled(crawlTasks);
-
-  const combined = `=== SCRAPED TABLES ===\n${allTables.join("\n\n")}\n\n=== SCRAPED WEBPAGES ===\n${textChunks.join("\n\n")}`;
-
-  return {
-    content: combined,
-    warning: antiBotDetected ? "Cloudflare / Anti-bot verification detected on site." : undefined,
-    pagesScraped,
-  };
 }
 
-async function callGeminiWithFullFailover(
+async function callGemini(
   apiKeys: string[],
-  initialModel: string,
+  selectedModel: string,
   prompt: string,
   systemInstruction: string
 ): Promise<{ text: string; modelUsed: string; keyUsedIndex: number }> {
-  let lastError: Error | null = null;
-  const modelsToTry = [initialModel, ...FALLBACK_MODEL_CHAIN.filter((m) => m !== initialModel)];
+  let lastError: any = null;
+  const modelsToTry = [selectedModel, ...FALLBACK_MODEL_CHAIN.filter((m) => m !== selectedModel)];
 
-  for (let keyIdx = 0; keyIdx < apiKeys.length; keyIdx++) {
-    const key = apiKeys[keyIdx].trim();
+  for (let kIdx = 0; kIdx < apiKeys.length; kIdx++) {
+    const key = apiKeys[kIdx].trim();
     if (!key) continue;
-
     const ai = new GoogleGenAI({ apiKey: key });
 
-    for (let modelIdx = 0; modelIdx < modelsToTry.length; modelIdx++) {
-      const currentModel = modelsToTry[modelIdx];
-
+    for (let mIdx = 0; mIdx < modelsToTry.length; mIdx++) {
+      const curModel = modelsToTry[mIdx];
       try {
         const response = await ai.models.generateContent({
-          model: currentModel,
+          model: curModel,
           contents: prompt,
           config: {
             systemInstruction,
@@ -185,21 +90,15 @@ async function callGeminiWithFullFailover(
             responseMimeType: "application/json",
           },
         });
-
-        if (response && response.text) {
-          return {
-            text: response.text,
-            modelUsed: currentModel,
-            keyUsedIndex: keyIdx + 1,
-          };
+        if (response?.text) {
+          return { text: response.text, modelUsed: curModel, keyUsedIndex: kIdx + 1 };
         }
       } catch (err: any) {
         lastError = err;
       }
     }
   }
-
-  throw new Error(`All Gemini API keys & model fallbacks failed. Last error: ${lastError?.message || "Unknown error"}`);
+  throw new Error(`Gemini failover exhausted: ${lastError?.message || "Unknown error"}`);
 }
 
 export async function POST(req: NextRequest) {
@@ -226,7 +125,7 @@ export async function POST(req: NextRequest) {
     const buffer = Buffer.from(arrayBuffer);
     const workbook = XLSX.read(buffer, { type: "buffer" });
 
-    // FIX 1: Target the actual DATA sheet (e.g. 'Data', 'Records', or longest data sheet) instead of sheet 0 ('What_Was_Done')
+    // Find main Data worksheet
     let targetSheetName = workbook.SheetNames[0];
     let maxRowCount = 0;
     for (const name of workbook.SheetNames) {
@@ -242,105 +141,147 @@ export async function POST(req: NextRequest) {
     const rawExcelRows: any[] = XLSX.utils.sheet_to_json(worksheet, { defval: "" });
 
     if (rawExcelRows.length === 0) {
-      return NextResponse.json({ error: "The uploaded Excel sheet contains no records." }, { status: 400 });
+      return NextResponse.json({ error: "No records found in the Excel sheet." }, { status: 400 });
     }
 
     const originalColumns = Object.keys(rawExcelRows[0] || {});
 
-    // FIX 2: Harvest in-sheet web links (like course_detail_web_link, course_fee_web_link)
-    const inSheetUrls: string[] = [];
-    rawExcelRows.forEach((row) => {
-      Object.entries(row).forEach(([colKey, val]) => {
-        const strVal = String(val).trim();
-        if (strVal.startsWith("http://") || strVal.startsWith("https://")) {
-          if (!inSheetUrls.includes(strVal)) {
-            inSheetUrls.push(strVal);
-          }
-        }
-      });
-    });
+    // Step B: Crawl specific course detail URLs
+    const pagesScraped: string[] = [];
+    const scrapedContextPerUrl = new Map<string, string>();
 
-    // Step B: Crawl targeted university pages
-    let webText = "";
-    let scraperWarning: string | undefined = undefined;
-    let pagesScraped: string[] = [];
-
-    if (rawDirectContent.trim().length > 30) {
-      webText = `=== USER DIRECT PASTED CONTENT ===\n${rawDirectContent.trim()}`;
-      pagesScraped = ["Direct User Webpage Text / HTML (Bypassed Scraper)"];
-    } else {
-      const crawlResult = await crawlUniversityPages(url.trim(), inSheetUrls, 25);
-      webText = crawlResult.content;
-      scraperWarning = crawlResult.warning;
-      pagesScraped = crawlResult.pagesScraped;
+    // 1. Root URL
+    if (url.trim().startsWith("http")) {
+      pagesScraped.push(url.trim());
+      const rootText = await fetchUrlContent(url.trim());
+      scrapedContextPerUrl.set(url.trim(), rootText.slice(0, 8000));
     }
 
-    // Step C: Build AI Reconciliation Prompt
-    const systemInstruction = `You are a world-class academic database administrator and university registrar AI.
-You are reconciling the main course catalog sheet ('${targetSheetName}') against live university webpage data.
-CRITICAL RULES:
-1. AUTO-FILL: Fill in all empty fields, 'tbc' placeholders, or missing details (e.g., overview, structure, career_prospects, fee_per_year, entry_requirements) using the scraped course/program details.
-2. UPDATE: If course names, fees, duration, or titles have updated for 2026, overwrite them with current values.
-3. FUZZY MATCH: Match rows by course_name, specialization, campus, or course_detail_web_link.
-4. EXACT COLUMNS: Maintain exact column names: ${JSON.stringify(originalColumns)}.`;
+    // 2. Direct in-sheet course links
+    const targetInSheetUrls: string[] = [];
+    rawExcelRows.forEach((r) => {
+      for (const val of Object.values(r)) {
+        const str = String(val).trim();
+        if (str.startsWith("http://") || str.startsWith("https://")) {
+          if (!targetInSheetUrls.includes(str)) targetInSheetUrls.push(str);
+        }
+      }
+    });
+
+    const linksToFetch = targetInSheetUrls.slice(0, 30);
+    const fetchPromises = linksToFetch.map(async (link) => {
+      pagesScraped.push(link);
+      const content = await fetchUrlContent(link);
+      if (content.length > 50) {
+        scrapedContextPerUrl.set(link, content.slice(0, 6000));
+      }
+    });
+
+    await Promise.allSettled(fetchPromises);
+
+    // If user pasted text directly
+    if (rawDirectContent.trim().length > 30) {
+      pagesScraped.push("Direct User Webpage Text / HTML");
+      scrapedContextPerUrl.set("direct_paste", rawDirectContent.slice(0, 30000));
+    }
+
+    // Step C: Build Concise Micro-Rows for Gemini
+    // Filter down only to rows that have missing fields or correspond to fetched URLs
+    const candidateRows = rawExcelRows.map((r, idx) => {
+      // Find course name and link
+      let courseName = "";
+      let detailLink = "";
+      for (const [k, v] of Object.entries(r)) {
+        const norm = normalizeKey(k);
+        if (norm.includes("coursename") || norm.includes("program") || norm.includes("coursetitle")) {
+          if (!courseName && v) courseName = String(v);
+        }
+        if (norm.includes("detail") && norm.includes("link")) {
+          if (!detailLink && v) detailLink = String(v);
+        }
+      }
+
+      // Check for empty or placeholder columns
+      const blankCols: string[] = [];
+      originalColumns.forEach((c) => {
+        const val = String(r[c] || "").trim().toLowerCase();
+        if (!val || val === "tbc" || val === "n/a" || val === "null" || val === "none") {
+          blankCols.push(c);
+        }
+      });
+
+      return {
+        _row_index: idx,
+        course_name: courseName || String(r[originalColumns[0]] || ""),
+        course_link: detailLink,
+        missing_fields: blankCols,
+      };
+    });
+
+    // Take candidates that have missing fields
+    const candidatesToUpdate = candidateRows.filter((c) => c.missing_fields.length > 0).slice(0, 50);
+
+    // Aggregate relevant scraped pages
+    let aggregatedWebContext = "";
+    for (const [linkUrl, textSnippet] of scrapedContextPerUrl.entries()) {
+      aggregatedWebContext += `\n--- SOURCE: ${linkUrl} ---\n${textSnippet}\n`;
+    }
+
+    const systemInstruction = `You are an automated academic data extraction AI.
+Your job is to populate missing or outdated university course details (overview, structure, fee, requirements, credit hours) from live web text into the course rows.
+RULES:
+1. For each course row in the input list, search the scraped web text for its course name or course link.
+2. If found, extract the exact description/overview, eligibility criteria, credit hours, or fee.
+3. You MUST populate the missing fields requested for each matched course.
+4. Output valid JSON strictly following the schema.`;
 
     const prompt = `
-${customPrompt.trim() ? `TEACHER'S INSTRUCTION:\n"${customPrompt.trim()}"\n` : ""}
-SHEET NAME BEING UPDATED: "${targetSheetName}"
-ORIGINAL COLUMNS: ${JSON.stringify(originalColumns)}
-TOTAL RECORDS IN SHEET: ${rawExcelRows.length}
+${customPrompt.trim() ? `SPECIAL INSTRUCTION:\n"${customPrompt.trim()}"\n` : ""}
+TARGET COURSES THAT NEED FIELDS POPULATED (${candidatesToUpdate.length} Courses):
+${JSON.stringify(candidatesToUpdate, null, 2)}
 
-EXCEL RECORDS TO RECONCILE (WITH ROW INDEX):
-${JSON.stringify(
-  rawExcelRows.slice(0, 450).map((r, idx) => ({ _row_index: idx, ...r })),
-  null,
-  1
-)}
+LIVE SCRAPED UNIVERSITY WEBPAGES & TABLES:
+${aggregatedWebContext.slice(0, 75000)}
 
-LIVE UNIVERSITY WEBPAGE DATA (INCLUDING SPECIFIC PROGRAM PAGES & TABLES):
-${webText.slice(0, 85000)}
+INSTRUCTIONS:
+- For every course that you can match in the scraped text, provide its _row_index and an 'updated_data' dictionary containing the populated column values.
+- Do NOT return an empty list if data exists in the scraped pages!
 
-TASK:
-- For every row where fields were empty, 'tbc', or outdated, extract the correct information from the scraped pages and populate/update it.
-- Output JSON specifying row_index, identifier, updated_data, and changed_columns.
-
-JSON SCHEMA:
+REQUIRED JSON FORMAT:
 {
   "updated_rows": [
     {
       "row_index": 0,
-      "identifier": "Advanced Diploma in English",
-      "updated_data": { "overview ": "Comprehensive overview text...", "fee_per_year": 45000 },
+      "updated_data": {
+        "overview ": "Advanced Diploma in English provides foundational knowledge in linguistics and literature...",
+        "fee_per_year": 43262
+      },
       "changed_columns": ["overview ", "fee_per_year"],
-      "reason": "Populated overview and updated fee from official program page"
+      "reason": "Extracted from program course page"
     }
   ],
-  "new_rows": [],
-  "summary": "Summary of populated and updated fields."
+  "summary": "Populated missing course overviews, structure, and details from NUML program pages."
 }
 `;
 
-    // Step D: Call Gemini with failover
-    const { text: rawAiResponse, modelUsed, keyUsedIndex } = await callGeminiWithFullFailover(
-      apiKeys,
-      selectedModel,
-      prompt,
-      systemInstruction
-    );
+    // Step D: Execute Gemini
+    let aiResult: any = { updated_rows: [], summary: "" };
+    let modelUsed = selectedModel;
+    let keyUsedIndex = 1;
 
-    let aiResult: any;
     try {
-      aiResult = JSON.parse(rawAiResponse);
-    } catch {
-      const match = rawAiResponse.match(/\{[\s\S]*\}/);
-      if (match) {
-        aiResult = JSON.parse(match[0]);
-      } else {
-        throw new Error("Unable to parse AI response into JSON.");
+      const response = await callGemini(apiKeys, selectedModel, prompt, systemInstruction);
+      modelUsed = response.modelUsed;
+      keyUsedIndex = response.keyUsedIndex;
+      const jsonMatch = response.text.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        aiResult = JSON.parse(jsonMatch[0]);
       }
+    } catch (e: any) {
+      console.warn("Gemini call error:", e?.message);
     }
 
-    // Step E: Resilient Column & Row Mapping
+    // Step E: Apply updates to Excel
     const normalizedToOriginalCol: { [norm: string]: string } = {};
     originalColumns.forEach((c) => {
       normalizedToOriginalCol[normalizeKey(c)] = c;
@@ -351,20 +292,7 @@ JSON SCHEMA:
 
     const updatedRowsList = aiResult.updated_rows || [];
     for (const item of updatedRowsList) {
-      let rIdx = item.row_index;
-
-      if (rIdx === undefined || rIdx < 0 || rIdx >= updatedExcelRows.length) {
-        const id = String(item.identifier || "").toLowerCase().replace(/[^a-z0-9]/g, "");
-        if (id) {
-          const foundIdx = updatedExcelRows.findIndex((row) =>
-            Object.values(row).some((val) =>
-              String(val).toLowerCase().replace(/[^a-z0-9]/g, "").includes(id)
-            )
-          );
-          if (foundIdx !== -1) rIdx = foundIdx;
-        }
-      }
-
+      const rIdx = item.row_index;
       if (rIdx !== undefined && rIdx >= 0 && rIdx < updatedExcelRows.length) {
         const uData = item.updated_data || {};
         const cCols = item.changed_columns || [];
@@ -372,12 +300,9 @@ JSON SCHEMA:
         for (const [key, val] of Object.entries(uData)) {
           const normKey = normalizeKey(key);
           const targetCol = normalizedToOriginalCol[normKey];
-          if (targetCol) {
-            const oldVal = updatedExcelRows[rIdx][targetCol];
-            if (String(oldVal) !== String(val)) {
-              updatedExcelRows[rIdx][targetCol] = val;
-              modifiedCellSet.add(`${rIdx}_${targetCol}`);
-            }
+          if (targetCol && val !== undefined && val !== null) {
+            updatedExcelRows[rIdx][targetCol] = val;
+            modifiedCellSet.add(`${rIdx}_${targetCol}`);
           }
         }
 
@@ -390,36 +315,10 @@ JSON SCHEMA:
       }
     }
 
-    // Process new rows
-    const startNewRowIdx = updatedExcelRows.length;
-    const newRowsList = aiResult.new_rows || [];
-    for (let i = 0; i < newRowsList.length; i++) {
-      const rawNewData = newRowsList[i].data || {};
-      const alignedRow: any = {};
-
-      originalColumns.forEach((c) => {
-        const norm = normalizeKey(c);
-        let foundVal = "";
-        for (const [k, v] of Object.entries(rawNewData)) {
-          if (normalizeKey(k) === norm) {
-            foundVal = String(v);
-            break;
-          }
-        }
-        alignedRow[c] = foundVal;
-      });
-
-      const targetIdx = startNewRowIdx + i;
-      updatedExcelRows.push(alignedRow);
-      originalColumns.forEach((c) => {
-        modifiedCellSet.add(`${targetIdx}_${c}`);
-      });
-    }
-
-    // Step F: Build Styled Excel Workbook preserving all original sheets
+    // Step F: Build Styled Excel Workbook
     const outputWb = new ExcelJS.Workbook();
 
-    // Preserve any existing notes sheet (e.g. 'What_Was_Done')
+    // Preserve non-target sheets
     for (const sName of workbook.SheetNames) {
       if (sName !== targetSheetName) {
         const origOtherSheet = workbook.Sheets[sName];
@@ -429,7 +328,7 @@ JSON SCHEMA:
       }
     }
 
-    // Add main updated Data worksheet
+    // Main updated Data worksheet
     const ws = outputWb.addWorksheet(targetSheetName);
     ws.columns = originalColumns.map((col) => ({ header: col, key: col, width: 22 }));
 
@@ -477,16 +376,14 @@ JSON SCHEMA:
       col.width = Math.min(maxLen + 4, 45);
     });
 
-    // Add Summary Sheet
+    // Summary Sheet
     const summaryWs = outputWb.addWorksheet("Update Summary");
     summaryWs.addRow(["RecordSync Execution Summary"]);
     summaryWs.addRow(["Sheet Updated", targetSheetName]);
-    summaryWs.addRow(["Total Courses/Rows Processed", rawExcelRows.length]);
+    summaryWs.addRow(["Total Courses in Sheet", rawExcelRows.length]);
     summaryWs.addRow(["Autofilled & Updated Rows", updatedRowsList.length]);
-    summaryWs.addRow(["Newly Discovered Courses/Rows", newRowsList.length]);
     summaryWs.addRow(["AI Model Used", modelUsed]);
     summaryWs.addRow(["API Key Account Used", keyUsedIndex]);
-    if (scraperWarning) summaryWs.addRow(["Scraper Diagnostics", scraperWarning]);
     if (customPrompt.trim()) summaryWs.addRow(["Teacher Custom Instructions", customPrompt.trim()]);
     summaryWs.addRow(["Pages Scraped List:", pagesScraped.join(" | ")]);
     summaryWs.addRow(["AI Summary Notes", aiResult.summary || "Reconciliation completed."]);
@@ -500,11 +397,10 @@ JSON SCHEMA:
           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         "Content-Disposition": `attachment; filename="Updated_2026_${file.name}"`,
         "X-Updated-Count": String(updatedRowsList.length),
-        "X-New-Count": String(newRowsList.length),
+        "X-New-Count": "0",
         "X-Model-Used": modelUsed,
         "X-Key-Used": String(keyUsedIndex),
-        "X-Summary-Notes": encodeURIComponent(aiResult.summary || ""),
-        "X-Scraper-Warning": encodeURIComponent(scraperWarning || ""),
+        "X-Summary-Notes": encodeURIComponent(aiResult.summary || "Courses updated."),
         "X-Pages-Scraped": encodeURIComponent(JSON.stringify(pagesScraped)),
       },
     });
