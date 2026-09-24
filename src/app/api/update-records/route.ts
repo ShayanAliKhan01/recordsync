@@ -125,7 +125,7 @@ export async function POST(req: NextRequest) {
     const buffer = Buffer.from(arrayBuffer);
     const workbook = XLSX.read(buffer, { type: "buffer" });
 
-    // Find main Data worksheet
+    // Target the main Data worksheet
     let targetSheetName = workbook.SheetNames[0];
     let maxRowCount = 0;
     for (const name of workbook.SheetNames) {
@@ -179,16 +179,13 @@ export async function POST(req: NextRequest) {
 
     await Promise.allSettled(fetchPromises);
 
-    // If user pasted text directly
     if (rawDirectContent.trim().length > 30) {
       pagesScraped.push("Direct User Webpage Text / HTML");
       scrapedContextPerUrl.set("direct_paste", rawDirectContent.slice(0, 30000));
     }
 
-    // Step C: Build Concise Micro-Rows for Gemini
-    // Filter down only to rows that have missing fields or correspond to fetched URLs
+    // Build candidate rows needing autofill
     const candidateRows = rawExcelRows.map((r, idx) => {
-      // Find course name and link
       let courseName = "";
       let detailLink = "";
       for (const [k, v] of Object.entries(r)) {
@@ -201,7 +198,6 @@ export async function POST(req: NextRequest) {
         }
       }
 
-      // Check for empty or placeholder columns
       const blankCols: string[] = [];
       originalColumns.forEach((c) => {
         const val = String(r[c] || "").trim().toLowerCase();
@@ -218,70 +214,71 @@ export async function POST(req: NextRequest) {
       };
     });
 
-    // Take candidates that have missing fields
-    const candidatesToUpdate = candidateRows.filter((c) => c.missing_fields.length > 0).slice(0, 50);
+    const candidatesToUpdate = candidateRows.filter((c) => c.missing_fields.length > 0);
 
-    // Aggregate relevant scraped pages
     let aggregatedWebContext = "";
     for (const [linkUrl, textSnippet] of scrapedContextPerUrl.entries()) {
       aggregatedWebContext += `\n--- SOURCE: ${linkUrl} ---\n${textSnippet}\n`;
     }
 
-    const systemInstruction = `You are an automated academic data extraction AI.
-Your job is to populate missing or outdated university course details (overview, structure, fee, requirements, credit hours) from live web text into the course rows.
+    const systemInstruction = `You are an automated academic database reconciler AI.
+Your job is to populate missing or outdated course details (overview, structure, fee, requirements, credit hours) for the given batch of course rows using the scraped university web text.
 RULES:
-1. For each course row in the input list, search the scraped web text for its course name or course link.
+1. For each course row in the batch, match its course name or link in the scraped text.
 2. If found, extract the exact description/overview, eligibility criteria, credit hours, or fee.
 3. You MUST populate the missing fields requested for each matched course.
-4. Output valid JSON strictly following the schema.`;
+4. Output valid JSON strictly matching the schema: {"updated_rows": [{"row_index": 0, "updated_data": {"Col": "Val"}, "changed_columns": ["Col"]}]}.`;
 
-    const prompt = `
+    // Step C: Run Sequential Batches of 20 Rows
+    const BATCH_SIZE = 20;
+    const allUpdatedRows: any[] = [];
+    let lastModelUsed = selectedModel;
+    let lastKeyUsedIndex = 1;
+
+    // Process in batches
+    const totalToProcess = Math.min(candidatesToUpdate.length, 100); // 5 batches max to stay comfortably inside Vercel's 60s execution limit
+    for (let i = 0; i < totalToProcess; i += BATCH_SIZE) {
+      const batchSlice = candidatesToUpdate.slice(i, i + BATCH_SIZE);
+
+      const prompt = `
 ${customPrompt.trim() ? `SPECIAL INSTRUCTION:\n"${customPrompt.trim()}"\n` : ""}
-TARGET COURSES THAT NEED FIELDS POPULATED (${candidatesToUpdate.length} Courses):
-${JSON.stringify(candidatesToUpdate, null, 2)}
+BATCH OF CANDIDATE COURSES TO POPULATE (${batchSlice.length} Courses):
+${JSON.stringify(batchSlice, null, 2)}
 
 LIVE SCRAPED UNIVERSITY WEBPAGES & TABLES:
 ${aggregatedWebContext.slice(0, 75000)}
 
 INSTRUCTIONS:
-- For every course that you can match in the scraped text, provide its _row_index and an 'updated_data' dictionary containing the populated column values.
-- Do NOT return an empty list if data exists in the scraped pages!
-
-REQUIRED JSON FORMAT:
+- For every course in this batch, output its _row_index and an 'updated_data' object containing the populated column values.
+- Return valid JSON:
 {
   "updated_rows": [
     {
       "row_index": 0,
-      "updated_data": {
-        "overview ": "Advanced Diploma in English provides foundational knowledge in linguistics and literature...",
-        "fee_per_year": 43262
-      },
-      "changed_columns": ["overview ", "fee_per_year"],
-      "reason": "Extracted from program course page"
+      "updated_data": {"overview ": "Detailed overview..."},
+      "changed_columns": ["overview "]
     }
-  ],
-  "summary": "Populated missing course overviews, structure, and details from NUML program pages."
+  ]
 }
 `;
 
-    // Step D: Execute Gemini
-    let aiResult: any = { updated_rows: [], summary: "" };
-    let modelUsed = selectedModel;
-    let keyUsedIndex = 1;
-
-    try {
-      const response = await callGemini(apiKeys, selectedModel, prompt, systemInstruction);
-      modelUsed = response.modelUsed;
-      keyUsedIndex = response.keyUsedIndex;
-      const jsonMatch = response.text.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        aiResult = JSON.parse(jsonMatch[0]);
+      try {
+        const response = await callGemini(apiKeys, selectedModel, prompt, systemInstruction);
+        lastModelUsed = response.modelUsed;
+        lastKeyUsedIndex = response.keyUsedIndex;
+        const jsonMatch = response.text.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          const parsed = JSON.parse(jsonMatch[0]);
+          if (Array.isArray(parsed.updated_rows)) {
+            allUpdatedRows.push(...parsed.updated_rows);
+          }
+        }
+      } catch (err: any) {
+        console.warn(`Batch ${i / BATCH_SIZE + 1} error:`, err?.message);
       }
-    } catch (e: any) {
-      console.warn("Gemini call error:", e?.message);
     }
 
-    // Step E: Apply updates to Excel
+    // Step D: Apply updates to Excel in-place
     const normalizedToOriginalCol: { [norm: string]: string } = {};
     originalColumns.forEach((c) => {
       normalizedToOriginalCol[normalizeKey(c)] = c;
@@ -290,8 +287,7 @@ REQUIRED JSON FORMAT:
     const updatedExcelRows = [...rawExcelRows];
     const modifiedCellSet = new Set<string>();
 
-    const updatedRowsList = aiResult.updated_rows || [];
-    for (const item of updatedRowsList) {
+    for (const item of allUpdatedRows) {
       const rIdx = item.row_index;
       if (rIdx !== undefined && rIdx >= 0 && rIdx < updatedExcelRows.length) {
         const uData = item.updated_data || {};
@@ -315,10 +311,9 @@ REQUIRED JSON FORMAT:
       }
     }
 
-    // Step F: Build Styled Excel Workbook
+    // Step E: Build in-place Styled Excel Workbook preserving all original sheets
     const outputWb = new ExcelJS.Workbook();
 
-    // Preserve non-target sheets
     for (const sName of workbook.SheetNames) {
       if (sName !== targetSheetName) {
         const origOtherSheet = workbook.Sheets[sName];
@@ -328,7 +323,6 @@ REQUIRED JSON FORMAT:
       }
     }
 
-    // Main updated Data worksheet
     const ws = outputWb.addWorksheet(targetSheetName);
     ws.columns = originalColumns.map((col) => ({ header: col, key: col, width: 22 }));
 
@@ -381,12 +375,11 @@ REQUIRED JSON FORMAT:
     summaryWs.addRow(["RecordSync Execution Summary"]);
     summaryWs.addRow(["Sheet Updated", targetSheetName]);
     summaryWs.addRow(["Total Courses in Sheet", rawExcelRows.length]);
-    summaryWs.addRow(["Autofilled & Updated Rows", updatedRowsList.length]);
-    summaryWs.addRow(["AI Model Used", modelUsed]);
-    summaryWs.addRow(["API Key Account Used", keyUsedIndex]);
+    summaryWs.addRow(["Autofilled & Updated Rows", allUpdatedRows.length]);
+    summaryWs.addRow(["AI Model Used", lastModelUsed]);
+    summaryWs.addRow(["API Key Account Used", lastKeyUsedIndex]);
     if (customPrompt.trim()) summaryWs.addRow(["Teacher Custom Instructions", customPrompt.trim()]);
     summaryWs.addRow(["Pages Scraped List:", pagesScraped.join(" | ")]);
-    summaryWs.addRow(["AI Summary Notes", aiResult.summary || "Reconciliation completed."]);
 
     const excelBuffer = await outputWb.xlsx.writeBuffer();
 
@@ -396,11 +389,11 @@ REQUIRED JSON FORMAT:
         "Content-Type":
           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         "Content-Disposition": `attachment; filename="Updated_2026_${file.name}"`,
-        "X-Updated-Count": String(updatedRowsList.length),
+        "X-Updated-Count": String(allUpdatedRows.length),
         "X-New-Count": "0",
-        "X-Model-Used": modelUsed,
-        "X-Key-Used": String(keyUsedIndex),
-        "X-Summary-Notes": encodeURIComponent(aiResult.summary || "Courses updated."),
+        "X-Model-Used": lastModelUsed,
+        "X-Key-Used": String(lastKeyUsedIndex),
+        "X-Summary-Notes": encodeURIComponent(`Batch engine updated ${allUpdatedRows.length} course records.`),
         "X-Pages-Scraped": encodeURIComponent(JSON.stringify(pagesScraped)),
       },
     });
