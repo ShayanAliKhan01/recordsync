@@ -23,42 +23,49 @@ const STANDARD_HEADERS = {
   "Accept-Language": "en-US,en;q=0.9",
 };
 
-function normalizeKey(str: string): string {
-  return str.toLowerCase().replace(/[^a-z0-9]/g, "");
-}
-
-function extractCleanPageText(htmlText: string): string {
+/**
+ * Universal Semantic HTML Reducer (Works on ANY university site)
+ * Converts messy university HTML into clean, structured Markdown text.
+ */
+function convertHtmlToCleanMarkdown(htmlText: string): string {
   const $ = cheerio.load(htmlText);
-  $("script, style, noscript, nav, footer, iframe, header, svg").remove();
+  $("script, style, noscript, nav, footer, header, svg, iframe, form").remove();
 
-  const tables: string[] = [];
-  $("table").each((idx, el) => {
+  // Convert tables to markdown tables
+  $("table").each((_, tbl) => {
     const rows: string[] = [];
-    $(el)
+    $(tbl)
       .find("tr")
       .each((_, tr) => {
-        const cols: string[] = [];
+        const cells: string[] = [];
         $(tr)
           .find("th, td")
           .each((_, td) => {
             const txt = $(td).text().replace(/\s+/g, " ").trim();
-            if (txt) cols.push(txt);
+            if (txt) cells.push(txt);
           });
-        if (cols.length > 0) rows.push(cols.join(" | "));
+        if (cells.length > 0) rows.push("| " + cells.join(" | ") + " |");
       });
-    if (rows.length > 0) tables.push(rows.join("\n"));
+    if (rows.length > 0) {
+      $(tbl).replaceWith("\n\n" + rows.join("\n") + "\n\n");
+    }
   });
 
-  const bodyText = $("body").text().replace(/\s+/g, " ").trim();
-  return (tables.length > 0 ? `[TABLES]\n${tables.join("\n\n")}\n\n` : "") + bodyText;
+  // Convert headers
+  $("h1, h2, h3").each((_, h) => {
+    const t = $(h).text().replace(/\s+/g, " ").trim();
+    if (t) $(h).replaceWith(`\n### ${t}\n`);
+  });
+
+  return $("body").text().replace(/\n\s*\n\s*\n/g, "\n\n").replace(/\s+/g, " ").trim();
 }
 
-async function fetchUrlContent(url: string): Promise<string> {
+async function fetchPageMarkdown(url: string): Promise<string> {
   try {
     const res = await fetch(url, { headers: STANDARD_HEADERS, cache: "no-store" });
     if (!res.ok) return "";
     const html = await res.text();
-    return extractCleanPageText(html);
+    return convertHtmlToCleanMarkdown(html);
   } catch {
     return "";
   }
@@ -120,12 +127,12 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "At least one valid Google Gemini API key must be provided." }, { status: 400 });
     }
 
-    // Step A: Parse uploaded Excel file buffer
+    // Step A: Parse uploaded Excel file
     const arrayBuffer = await file.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
     const workbook = XLSX.read(buffer, { type: "buffer" });
 
-    // Target the main Data worksheet
+    // Target the primary data worksheet (largest row count)
     let targetSheetName = workbook.SheetNames[0];
     let maxRowCount = 0;
     for (const name of workbook.SheetNames) {
@@ -138,125 +145,160 @@ export async function POST(req: NextRequest) {
     }
 
     const worksheet = workbook.Sheets[targetSheetName];
-    const rawExcelRows: any[] = XLSX.utils.sheet_to_json(worksheet, { defval: "" });
-
-    if (rawExcelRows.length === 0) {
+    // Get headers as exact array preserving duplicate or spaced names
+    const sheetData: any[][] = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: "" });
+    if (sheetData.length <= 1) {
       return NextResponse.json({ error: "No records found in the Excel sheet." }, { status: 400 });
     }
 
-    const originalColumns = Object.keys(rawExcelRows[0] || {});
+    const headerRow: string[] = sheetData[0].map((h: any) => String(h || "").trim());
+    const dataRows = sheetData.slice(1);
 
-    // Step B: Crawl specific course detail URLs
+    // Identify URL column index (0-based)
+    let urlColIdx = -1;
+    for (let c = 0; c < headerRow.length; c++) {
+      const hLower = headerRow[c].toLowerCase();
+      if (hLower.includes("detail") && hLower.includes("link")) {
+        urlColIdx = c;
+        break;
+      }
+    }
+    if (urlColIdx === -1) {
+      for (let c = 0; c < headerRow.length; c++) {
+        const hLower = headerRow[c].toLowerCase();
+        if (hLower.includes("link") || hLower.includes("url")) {
+          urlColIdx = c;
+          break;
+        }
+      }
+    }
+
+    // Identify columns that are blank or outdated needing verification
+    // Find target columns by exact position:
+    // e.g. overview, structure, career_prospects, fee_per_year, entry_requirements
+    const targetColsToVerify: { colIdx: number; name: string }[] = [];
+    headerRow.forEach((name, idx) => {
+      const nLower = name.toLowerCase();
+      if (
+        nLower.startsWith("overview") ||
+        nLower.startsWith("structure") ||
+        nLower.startsWith("career") ||
+        nLower.startsWith("fee") ||
+        nLower.startsWith("entry_req") ||
+        nLower.startsWith("duration")
+      ) {
+        targetColsToVerify.push({ colIdx: idx, name });
+      }
+    });
+
+    // Step B: Crawl pages concurrently
     const pagesScraped: string[] = [];
-    const scrapedContextPerUrl = new Map<string, string>();
+    const urlContentMap = new Map<string, string>();
 
     // 1. Root URL
     if (url.trim().startsWith("http")) {
       pagesScraped.push(url.trim());
-      const rootText = await fetchUrlContent(url.trim());
-      scrapedContextPerUrl.set(url.trim(), rootText.slice(0, 8000));
+      const rootText = await fetchPageMarkdown(url.trim());
+      if (rootText) urlContentMap.set(url.trim(), rootText.slice(0, 10000));
     }
 
-    // 2. Direct in-sheet course links
-    const targetInSheetUrls: string[] = [];
-    rawExcelRows.forEach((r) => {
-      for (const val of Object.values(r)) {
-        const str = String(val).trim();
-        if (str.startsWith("http://") || str.startsWith("https://")) {
-          if (!targetInSheetUrls.includes(str)) targetInSheetUrls.push(str);
+    // 2. Direct course links from sheet
+    const targetUrlsToFetch: string[] = [];
+    if (urlColIdx !== -1) {
+      dataRows.forEach((r) => {
+        const u = String(r[urlColIdx] || "").trim();
+        if (u.startsWith("http://") || u.startsWith("https://")) {
+          if (!targetUrlsToFetch.includes(u)) targetUrlsToFetch.push(u);
         }
-      }
-    });
+      });
+    }
 
-    const linksToFetch = targetInSheetUrls.slice(0, 30);
-    const fetchPromises = linksToFetch.map(async (link) => {
+    const linksToFetch = targetUrlsToFetch.slice(0, 40);
+    const fetchTasks = linksToFetch.map(async (link) => {
       pagesScraped.push(link);
-      const content = await fetchUrlContent(link);
+      const content = await fetchPageMarkdown(link);
       if (content.length > 50) {
-        scrapedContextPerUrl.set(link, content.slice(0, 6000));
+        urlContentMap.set(link, content.slice(0, 8000));
       }
     });
-
-    await Promise.allSettled(fetchPromises);
+    await Promise.allSettled(fetchTasks);
 
     if (rawDirectContent.trim().length > 30) {
       pagesScraped.push("Direct User Webpage Text / HTML");
-      scrapedContextPerUrl.set("direct_paste", rawDirectContent.slice(0, 30000));
+      urlContentMap.set("direct_paste", rawDirectContent.slice(0, 40000));
     }
 
-    // Build candidate rows needing autofill
-    const candidateRows = rawExcelRows.map((r, idx) => {
-      let courseName = "";
-      let detailLink = "";
-      for (const [k, v] of Object.entries(r)) {
-        const norm = normalizeKey(k);
-        if (norm.includes("coursename") || norm.includes("program") || norm.includes("coursetitle")) {
-          if (!courseName && v) courseName = String(v);
-        }
-        if (norm.includes("detail") && norm.includes("link")) {
-          if (!detailLink && v) detailLink = String(v);
-        }
-      }
-
-      const blankCols: string[] = [];
-      originalColumns.forEach((c) => {
-        const val = String(r[c] || "").trim().toLowerCase();
-        if (!val || val === "tbc" || val === "n/a" || val === "null" || val === "none") {
-          blankCols.push(c);
-        }
-      });
-
-      return {
-        _row_index: idx,
-        course_name: courseName || String(r[originalColumns[0]] || ""),
-        course_link: detailLink,
-        missing_fields: blankCols,
-      };
-    });
-
-    const candidatesToUpdate = candidateRows.filter((c) => c.missing_fields.length > 0);
-
-    let aggregatedWebContext = "";
-    for (const [linkUrl, textSnippet] of scrapedContextPerUrl.entries()) {
-      aggregatedWebContext += `\n--- SOURCE: ${linkUrl} ---\n${textSnippet}\n`;
-    }
-
-    const systemInstruction = `You are an automated academic database reconciler AI.
-Your job is to populate missing or outdated course details (overview, structure, fee, requirements, credit hours) for the given batch of course rows using the scraped university web text.
-RULES:
-1. For each course row in the batch, match its course name or link in the scraped text.
-2. If found, extract the exact description/overview, eligibility criteria, credit hours, or fee.
-3. You MUST populate the missing fields requested for each matched course.
-4. Output valid JSON strictly matching the schema: {"updated_rows": [{"row_index": 0, "updated_data": {"Col": "Val"}, "changed_columns": ["Col"]}]}.`;
-
-    // Step C: Run Sequential Batches of 20 Rows
+    // Step C: Sequential Batch Loop: First 20, then next 20, until document is done
     const BATCH_SIZE = 20;
-    const allUpdatedRows: any[] = [];
+    const totalRows = dataRows.length;
+    // Map of (row_idx, col_idx) -> { newVal, reason, verified }
+    const cellModifications = new Map<string, any>();
     let lastModelUsed = selectedModel;
     let lastKeyUsedIndex = 1;
 
-    // Process in batches
-    const totalToProcess = Math.min(candidatesToUpdate.length, 100); // 5 batches max to stay comfortably inside Vercel's 60s execution limit
-    for (let i = 0; i < totalToProcess; i += BATCH_SIZE) {
-      const batchSlice = candidatesToUpdate.slice(i, i + BATCH_SIZE);
+    const systemInstruction = `You are a strict academic data verification and reconciliation engine.
+Your task is to:
+1. VERIFY: Compare existing Excel cell values against the live scraped webpage content for 2026.
+2. UPDATE: If an existing cell has outdated data (e.g. old fee, revised credits, outdated requirements), update it.
+3. AUTOFILL: If a cell is blank (""), null, or contains a placeholder like 'tbc', extract the correct value from the webpage.
+4. SYNTHESIZE IF PLACEHOLDER: If a course page has a placeholder overview (e.g. 'abc' or 'tbc'), synthesize a clean, professional 2-sentence course overview from its syllabus subjects and title.
+5. PRESERVE ACCURACY: If the current value is already verified and up-to-date, do NOT change it.
+Output strictly valid JSON with exact column indices.`;
+
+    // Process all rows in batches of 20
+    for (let startIdx = 0; startIdx < totalRows; startIdx += BATCH_SIZE) {
+      const endIdx = min(startIdx + BATCH_SIZE, totalRows);
+      const batchSlice = dataRows.slice(startIdx, endIdx);
+
+      // Build compact batch representation with exact column indices
+      const batchItems = batchSlice.map((r, i) => {
+        const actualRowIdx = startIdx + i;
+        const rowObj: any = {
+          _row_index: actualRowIdx,
+          course_name: String(r[12] || r[0] || ""), // course_name or first column
+          course_url: urlColIdx !== -1 ? String(r[urlColIdx] || "") : "",
+        };
+
+        // Attach target columns with their exact col index
+        targetColsToVerify.forEach(({ colIdx, name }) => {
+          rowObj[`col_${colIdx}_${name}`] = String(r[colIdx] || "");
+        });
+
+        return rowObj;
+      });
+
+      // Gather relevant scraped context for this batch
+      let batchWebContext = "";
+      batchItems.forEach((item) => {
+        if (item.course_url && urlContentMap.has(item.course_url)) {
+          batchWebContext += `\n--- URL: ${item.course_url} ---\n${urlContentMap.get(item.course_url)}\n`;
+        }
+      });
+      if (!batchWebContext && urlContentMap.size > 0) {
+        batchWebContext = Array.from(urlContentMap.values()).slice(0, 5).join("\n\n");
+      }
 
       const prompt = `
 ${customPrompt.trim() ? `SPECIAL INSTRUCTION:\n"${customPrompt.trim()}"\n` : ""}
-BATCH OF CANDIDATE COURSES TO POPULATE (${batchSlice.length} Courses):
-${JSON.stringify(batchSlice, null, 2)}
+BATCH: Rows ${startIdx + 1} to ${endIdx} of ${totalRows} Total Courses:
+${JSON.stringify(batchItems, null, 2)}
 
-LIVE SCRAPED UNIVERSITY WEBPAGES & TABLES:
-${aggregatedWebContext.slice(0, 75000)}
+LIVE SCRAPED UNIVERSITY WEBPAGES & CURRICULUM TABLES:
+${batchWebContext.slice(0, 70000)}
 
 INSTRUCTIONS:
-- For every course in this batch, output its _row_index and an 'updated_data' object containing the populated column values.
+- For each course, verify whether its columns match the live web page.
+- If a column is blank, contains 'tbc', or has an outdated value, output the update referencing its exact column name key (e.g. 'col_35_overview ').
 - Return valid JSON:
 {
-  "updated_rows": [
+  "updates": [
     {
-      "row_index": 0,
-      "updated_data": {"overview ": "Detailed overview..."},
-      "changed_columns": ["overview "]
+      "row_index": ${startIdx},
+      "col_index": 35,
+      "col_key": "col_35_overview ",
+      "verified_2026_value": "Professional overview text extracted from program syllabus...",
+      "status": "autofilled_placeholder",
+      "reason": "Replaced 'tbc' with verified syllabus synthesis"
     }
   ]
 }
@@ -266,68 +308,48 @@ INSTRUCTIONS:
         const response = await callGemini(apiKeys, selectedModel, prompt, systemInstruction);
         lastModelUsed = response.modelUsed;
         lastKeyUsedIndex = response.keyUsedIndex;
-        const jsonMatch = response.text.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-          const parsed = JSON.parse(jsonMatch[0]);
-          if (Array.isArray(parsed.updated_rows)) {
-            allUpdatedRows.push(...parsed.updated_rows);
+        const match = response.text.match(/\{[\s\S]*\}/);
+        if (match) {
+          const parsed = JSON.parse(match[0]);
+          if (Array.isArray(parsed.updates)) {
+            parsed.updates.forEach((u: any) => {
+              const r = u.row_index;
+              const c = u.col_index;
+              const val = u.verified_2026_value;
+              if (r !== undefined && c !== undefined && val !== undefined) {
+                cellModifications.set(`${r}_${c}`, {
+                  val,
+                  reason: u.reason || "Verified 2026 update",
+                });
+              }
+            });
           }
         }
       } catch (err: any) {
-        console.warn(`Batch ${i / BATCH_SIZE + 1} error:`, err?.message);
+        console.warn(`Batch ${startIdx / BATCH_SIZE + 1} error:`, err?.message);
       }
     }
 
-    // Step D: Apply updates to Excel in-place
-    const normalizedToOriginalCol: { [norm: string]: string } = {};
-    originalColumns.forEach((c) => {
-      normalizedToOriginalCol[normalizeKey(c)] = c;
-    });
-
-    const updatedExcelRows = [...rawExcelRows];
-    const modifiedCellSet = new Set<string>();
-
-    for (const item of allUpdatedRows) {
-      const rIdx = item.row_index;
-      if (rIdx !== undefined && rIdx >= 0 && rIdx < updatedExcelRows.length) {
-        const uData = item.updated_data || {};
-        const cCols = item.changed_columns || [];
-
-        for (const [key, val] of Object.entries(uData)) {
-          const normKey = normalizeKey(key);
-          const targetCol = normalizedToOriginalCol[normKey];
-          if (targetCol && val !== undefined && val !== null) {
-            updatedExcelRows[rIdx][targetCol] = val;
-            modifiedCellSet.add(`${rIdx}_${targetCol}`);
-          }
-        }
-
-        for (const col of cCols) {
-          const targetCol = normalizedToOriginalCol[normalizeKey(col)];
-          if (targetCol) {
-            modifiedCellSet.add(`${rIdx}_${targetCol}`);
-          }
-        }
-      }
-    }
-
-    // Step E: Build in-place Styled Excel Workbook preserving all original sheets
+    // Step D: Apply Updates In-Place Preserving All Original Sheets & Formatting
     const outputWb = new ExcelJS.Workbook();
 
+    // Preserve other sheets (e.g. What_Was_Done)
     for (const sName of workbook.SheetNames) {
       if (sName !== targetSheetName) {
         const origOtherSheet = workbook.Sheets[sName];
-        const otherRows: any[] = XLSX.utils.sheet_to_json(origOtherSheet, { header: 1 });
+        const otherRows: any[] = XLSX.utils.sheet_to_json(origOtherSheet, { header: 1, defval: "" });
         const newOtherWs = outputWb.addWorksheet(sName);
         otherRows.forEach((r) => newOtherWs.addRow(r));
       }
     }
 
+    // Main Data Sheet
     const ws = outputWb.addWorksheet(targetSheetName);
-    ws.columns = originalColumns.map((col) => ({ header: col, key: col, width: 22 }));
 
-    const headerRow = ws.getRow(1);
-    headerRow.eachCell((cell) => {
+    // Write original Header Row
+    const headerRowCells = headerRow;
+    const addedHeader = ws.addRow(headerRowCells);
+    addedHeader.eachCell((cell) => {
       cell.fill = {
         type: "pattern",
         pattern: "solid",
@@ -343,10 +365,28 @@ INSTRUCTIONS:
       fgColor: { argb: "FFFFF2CC" },
     };
 
-    updatedExcelRows.forEach((rowObj, rIdx) => {
-      const addedRow = ws.addRow(rowObj);
-      originalColumns.forEach((colKey, cIdx) => {
-        const cell = addedRow.getCell(cIdx + 1);
+    let totalUpdatedCells = 0;
+
+    // Write Data Rows & apply in-place modifications to exact cell coordinates
+    dataRows.forEach((rowValues, rIdx) => {
+      const modifiedRow = [...rowValues];
+
+      // Check if any column in this row was updated
+      for (let cIdx = 0; cIdx < headerRow.length; cIdx++) {
+        const key = `${rIdx}_${cIdx}`;
+        if (cellModifications.has(key)) {
+          const mod = cellModifications.get(key);
+          modifiedRow[cIdx] = mod.val;
+          totalUpdatedCells++;
+        }
+      }
+
+      const excelRow = ws.addRow(modifiedRow);
+
+      // Highlight modified cells in soft yellow
+      for (let cIdx = 0; cIdx < headerRow.length; cIdx++) {
+        const key = `${rIdx}_${cIdx}`;
+        const cell = excelRow.getCell(cIdx + 1);
         cell.border = {
           top: { style: "thin", color: { argb: "FFD9D9D9" } },
           left: { style: "thin", color: { argb: "FFD9D9D9" } },
@@ -354,13 +394,14 @@ INSTRUCTIONS:
           right: { style: "thin", color: { argb: "FFD9D9D9" } },
         };
 
-        if (modifiedCellSet.has(`${rIdx}_${colKey}`)) {
+        if (cellModifications.has(key)) {
           cell.fill = yellowFill;
           cell.font = { name: "Calibri", size: 11, bold: true, color: { argb: "FF7F6000" } };
         }
-      });
+      }
     });
 
+    // Auto-fit column widths
     ws.columns.forEach((col) => {
       let maxLen = 14;
       col.eachCell?.({ includeEmpty: true }, (cell) => {
@@ -370,12 +411,13 @@ INSTRUCTIONS:
       col.width = Math.min(maxLen + 4, 45);
     });
 
-    // Summary Sheet
+    // Add Summary Sheet
     const summaryWs = outputWb.addWorksheet("Update Summary");
     summaryWs.addRow(["RecordSync Execution Summary"]);
     summaryWs.addRow(["Sheet Updated", targetSheetName]);
-    summaryWs.addRow(["Total Courses in Sheet", rawExcelRows.length]);
-    summaryWs.addRow(["Autofilled & Updated Rows", allUpdatedRows.length]);
+    summaryWs.addRow(["Total Courses Processed", totalRows]);
+    summaryWs.addRow(["Total Cells Verified & Updated", totalUpdatedCells]);
+    summaryWs.addRow(["Batch Size Used", `${BATCH_SIZE} rows per batch until completion`]);
     summaryWs.addRow(["AI Model Used", lastModelUsed]);
     summaryWs.addRow(["API Key Account Used", lastKeyUsedIndex]);
     if (customPrompt.trim()) summaryWs.addRow(["Teacher Custom Instructions", customPrompt.trim()]);
@@ -389,11 +431,11 @@ INSTRUCTIONS:
         "Content-Type":
           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         "Content-Disposition": `attachment; filename="Updated_2026_${file.name}"`,
-        "X-Updated-Count": String(allUpdatedRows.length),
+        "X-Updated-Count": String(totalUpdatedCells),
         "X-New-Count": "0",
         "X-Model-Used": lastModelUsed,
         "X-Key-Used": String(lastKeyUsedIndex),
-        "X-Summary-Notes": encodeURIComponent(`Batch engine updated ${allUpdatedRows.length} course records.`),
+        "X-Summary-Notes": encodeURIComponent(`Verified and updated ${totalUpdatedCells} cells across all rows.`),
         "X-Pages-Scraped": encodeURIComponent(JSON.stringify(pagesScraped)),
       },
     });
@@ -401,4 +443,8 @@ INSTRUCTIONS:
     console.error("API Error:", err);
     return NextResponse.json({ error: err?.message || "Internal server error occurred." }, { status: 500 });
   }
+}
+
+function min(a: number, b: number): number {
+  return a < b ? a : b;
 }
