@@ -120,7 +120,7 @@ export async function POST(req: NextRequest) {
     const body = await req.json();
     const {
       targetColumns = [], // Array of { index: number, name: string }
-      batchCourses = [],  // Array of { rowIndex, entityTitle, campus, url, currentFields: Record<string, any> }
+      batchCourses = [],  // Array of { rowIndex, entityTitle, campus, url, rowUrls: Record<string, string>, currentFields: Record<string, any> }
       apiKeys = [],
       model = "gemini-2.5-flash",
       customPrompt = "",
@@ -136,28 +136,51 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "At least one Gemini API key is required." }, { status: 400 });
     }
 
-    // Scrape or load from cache for each course in this batch
-    const scrapedContextPerCourse: { [rowId: number]: string } = {};
+    // Scrape or load from cache for all dedicated link columns associated with each course
+    const scrapedContextPerCourse: { [rowId: number]: Record<string, string> } = {};
     const discontinuedFlags: { [rowId: number]: boolean } = {};
     const newlyScraped: { [url: string]: string } = {};
 
-    const fetchTasks = batchCourses.map(async (course: any) => {
+    const fetchTasks: Promise<any>[] = [];
+
+    batchCourses.forEach((course: any) => {
       const rId = course.rowIndex;
-      const url = course.url || "";
-      if (url.startsWith("http")) {
-        if (cachedWebpages && cachedWebpages[url]) {
-          scrapedContextPerCourse[rId] = cachedWebpages[url];
-        } else {
-          const { text: md, isDiscontinued } = await fetchPageWithTimeout(url, 3500);
-          if (md) {
-            scrapedContextPerCourse[rId] = md;
-            newlyScraped[url] = md;
-          }
-          if (isDiscontinued) {
-            discontinuedFlags[rId] = true;
+      scrapedContextPerCourse[rId] = {};
+
+      const urlsToFetch: { label: string; url: string }[] = [];
+
+      // Check if specific columns contain links where specific data is available
+      if (course.rowUrls && typeof course.rowUrls === "object") {
+        for (const [colName, urlVal] of Object.entries(course.rowUrls)) {
+          if (typeof urlVal === "string" && urlVal.startsWith("http")) {
+            urlsToFetch.push({ label: colName, url: urlVal.trim() });
           }
         }
       }
+
+      // Fallback single URL
+      if (urlsToFetch.length === 0 && course.url && String(course.url).startsWith("http")) {
+        urlsToFetch.push({ label: "general_link", url: String(course.url).trim() });
+      }
+
+      urlsToFetch.forEach(({ label, url }) => {
+        fetchTasks.push(
+          (async () => {
+            if (cachedWebpages && cachedWebpages[url]) {
+              scrapedContextPerCourse[rId][label] = cachedWebpages[url];
+            } else {
+              const { text: md, isDiscontinued } = await fetchPageWithTimeout(url, 3500);
+              if (md) {
+                scrapedContextPerCourse[rId][label] = md;
+                newlyScraped[url] = md;
+              }
+              if (isDiscontinued) {
+                discontinuedFlags[rId] = true;
+              }
+            }
+          })()
+        );
+      });
     });
 
     await Promise.allSettled(fetchTasks);
@@ -165,12 +188,18 @@ export async function POST(req: NextRequest) {
     // Target column names for prompt
     const colNames = targetColumns.map((c: any) => c.name);
 
-    // Format courses with their current box values and scraped text
+    // Format courses with their source-attributed scraped texts
     const formattedBatch = batchCourses.map((c: any) => {
       const rId = c.rowIndex;
-      let webText = scrapedContextPerCourse[rId] || "";
-      if (!webText && fallbackDirectContent) {
-        webText = fallbackDirectContent.slice(0, 4000);
+      const sources = scrapedContextPerCourse[rId] || {};
+
+      const scrapedSources: Record<string, string> = {};
+      for (const [colSource, md] of Object.entries(sources)) {
+        scrapedSources[`scraped_from_${colSource}`] = md.slice(0, 5000);
+      }
+
+      if (Object.keys(scrapedSources).length === 0 && fallbackDirectContent) {
+        scrapedSources["fallback_direct_content"] = fallbackDirectContent.slice(0, 4000);
       }
 
       return {
@@ -179,9 +208,7 @@ export async function POST(req: NextRequest) {
         campus: c.campus || "",
         current_target_boxes: c.currentFields || {},
         is_page_marked_discontinued_or_404: Boolean(discontinuedFlags[rId]),
-        scraped_webpage_content: webText
-          ? webText.slice(0, 6000)
-          : "Extract or synthesize verified academic value based on the program title.",
+        available_scraped_sites: scrapedSources,
       };
     });
 
@@ -189,13 +216,23 @@ export async function POST(req: NextRequest) {
 Your task is to accurately verify and populate the TARGET COLUMNS for every course in this batch.
 TARGET COLUMNS: ${JSON.stringify(colNames)}
 
-RULES FOR EACH TARGET COLUMN:
-1. DISCONTINUED: If the page says discontinued or returns 404, set status: "DISCONTINUED" and value: "Discontinued in 2026".
-2. OVERVIEW / DESCRIPTION: Extract genuine 2-3 sentence overview from scraped text. If blank or 'tbc', synthesize a verified overview. NEVER leave 'tbc'.
-3. STRUCTURE / CURRICULUM: Extract all subjects, course codes, and credit hours from the curriculum table into a clean comma-separated list.
-4. FEE / TUITION: Calculate or extract annual tuition. If semester fee is listed, multiply by 2. Return clean numeric/currency text.
-5. ENTRY REQUIREMENTS: Extract eligibility criteria, percentage, or degree requirements.
-6. If the current value already matches 2026 data, keep it and mark "VERIFIED_CURRENT". If blank or 'tbc', mark "AUTOFILLED". If outdated, mark "UPDATED".
+CRITICAL DEDICATED SITE MATCHING:
+In this university database, specific columns have their official data available on specific dedicated websites:
+1. FEE / TUITION COLUMNS (e.g., 'fee_per_year', 'tuition_fee', 'per_credit_fee'):
+   - Inspect the website scraped from the FEE LINK (e.g., 'scraped_from_course_fee_web_link' or 'scraped_from_fee_url').
+   - Calculate or extract the 2026 annual tuition. If semester fee is listed, multiply by 2. Return clean numeric/currency text.
+2. OVERVIEW / DESCRIPTION COLUMNS (e.g., 'overview', 'overview ', 'course_description'):
+   - Inspect the website scraped from the COURSE DETAIL LINK (e.g., 'scraped_from_course_detail_web_link').
+   - Extract genuine 2-3 sentence overview. If blank or 'tbc', synthesize a verified overview. NEVER leave 'tbc'.
+3. STRUCTURE / CURRICULUM COLUMNS (e.g., 'structure', 'syllabus'):
+   - Inspect the course detail page syllabus/curriculum table.
+   - Extract all subjects, course codes, and credit hours into a clean comma-separated list.
+4. ENTRY REQUIREMENTS / ELIGIBILITY:
+   - Check the admission portal link ('scraped_from_course_apply_web_link') or the course detail page.
+   - Extract minimum degree, percentage, or GPA criteria.
+5. If the current box already accurately matches the 2026 data, keep it and mark "VERIFIED_CURRENT". If blank or 'tbc', mark "AUTOFILLED". If outdated, mark "UPDATED".
+6. DISCONTINUED: If any official source says the course is discontinued or returns 404, set status: "DISCONTINUED" and value: "Discontinued in 2026".
+
 Output strictly valid JSON with exact column keys matching the target column names.`;
 
     const prompt = `

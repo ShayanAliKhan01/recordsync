@@ -141,28 +141,59 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "At least one Gemini API key is required." }, { status: 400 });
     }
 
-    // Scrape or load from cache for each row
-    const scrapedContextPerCourse: { [rowId: number]: string } = {};
+    const scrapedContextPerCourse: { [rowId: number]: Record<string, string> } = {};
     const discontinuedFlags: { [rowId: number]: boolean } = {};
     const newlyScraped: { [url: string]: string } = {};
 
-    const fetchTasks = batchRows.map(async (row: any) => {
+    const fetchTasks: Promise<any>[] = [];
+
+    const lowerColName = columnName.toLowerCase();
+
+    batchRows.forEach((row: any) => {
       const rId = row.rowIndex;
-      const url = row.url || "";
-      if (url.startsWith("http")) {
-        if (cachedWebpages && cachedWebpages[url]) {
-          scrapedContextPerCourse[rId] = cachedWebpages[url];
-        } else {
-          const { text: md, isDiscontinued } = await fetchPageWithTimeout(url, 3500);
-          if (md) {
-            scrapedContextPerCourse[rId] = md;
-            newlyScraped[url] = md;
-          }
-          if (isDiscontinued) {
-            discontinuedFlags[rId] = true;
+      scrapedContextPerCourse[rId] = {};
+
+      const urlsToFetch: { label: string; url: string; priority: number }[] = [];
+
+      if (row.rowUrls && typeof row.rowUrls === "object") {
+        for (const [colSource, urlVal] of Object.entries(row.rowUrls)) {
+          if (typeof urlVal === "string" && urlVal.startsWith("http")) {
+            const lowerSource = colSource.toLowerCase();
+            let prio = 1;
+            if (lowerColName.includes("fee") && lowerSource.includes("fee")) prio = 10;
+            if ((lowerColName.includes("structure") || lowerColName.includes("overview")) && lowerSource.includes("detail")) prio = 10;
+            if (lowerColName.includes("requirement") && (lowerSource.includes("apply") || lowerSource.includes("admission"))) prio = 10;
+
+            urlsToFetch.push({ label: colSource, url: urlVal.trim(), priority: prio });
           }
         }
       }
+
+      if (urlsToFetch.length === 0 && row.url && String(row.url).startsWith("http")) {
+        urlsToFetch.push({ label: "general_link", url: String(row.url).trim(), priority: 5 });
+      }
+
+      // Sort by priority so matching site is fetched first
+      urlsToFetch.sort((a, b) => b.priority - a.priority);
+
+      urlsToFetch.forEach(({ label, url }) => {
+        fetchTasks.push(
+          (async () => {
+            if (cachedWebpages && cachedWebpages[url]) {
+              scrapedContextPerCourse[rId][label] = cachedWebpages[url];
+            } else {
+              const { text: md, isDiscontinued } = await fetchPageWithTimeout(url, 3500);
+              if (md) {
+                scrapedContextPerCourse[rId][label] = md;
+                newlyScraped[url] = md;
+              }
+              if (isDiscontinued) {
+                discontinuedFlags[rId] = true;
+              }
+            }
+          })()
+        );
+      });
     });
 
     await Promise.allSettled(fetchTasks);
@@ -170,9 +201,15 @@ export async function POST(req: NextRequest) {
     // Format rows for prompt
     const formattedBatch = batchRows.map((r: any) => {
       const rId = r.rowIndex;
-      let webText = scrapedContextPerCourse[rId] || "";
-      if (!webText && fallbackDirectContent) {
-        webText = fallbackDirectContent.slice(0, 4000);
+      const sources = scrapedContextPerCourse[rId] || {};
+
+      const availableSites: Record<string, string> = {};
+      for (const [colSource, md] of Object.entries(sources)) {
+        availableSites[`site_from_${colSource}`] = md.slice(0, 5000);
+      }
+
+      if (Object.keys(availableSites).length === 0 && fallbackDirectContent) {
+        availableSites["fallback_direct_content"] = fallbackDirectContent.slice(0, 4000);
       }
 
       return {
@@ -181,43 +218,25 @@ export async function POST(req: NextRequest) {
         campus: r.campus || "",
         current_box_value: r.currentValue !== undefined && r.currentValue !== null ? String(r.currentValue).trim() : "",
         is_page_marked_discontinued_or_404: Boolean(discontinuedFlags[rId]),
-        scraped_webpage_content: webText
-          ? webText.slice(0, 6000)
-          : "Extract or synthesize verified academic value based on the program title.",
+        scraped_websites: availableSites,
       };
     });
 
     const systemInstruction = `You are an expert academic database auditor, registrar, and quality assurance officer.
 Your task is to perform an explicit BOX-BY-BOX VERIFICATION for the target column: "${columnName}".
-Evaluate the current box value against the scraped 2026 webpage content.
 
-DECISION PROTOCOL FOR "${columnName}":
-1. DISCONTINUED COURSES:
-   - If the webpage indicates the course is discontinued, not offered in 2026, or returns HTTP 404:
-     - Set status: "DISCONTINUED"
-     - Set verified_value: "Discontinued in 2026"
-     - Set confidence: "HIGH"
-     - Provide the reason and evidence quote.
-2. MISSING / PLACEHOLDER VALUES:
-   - If current box value is empty, null, or placeholder (e.g. 'tbc', 'abc', 'tbd', 'none', 'n/a', '-'):
-     - Extract genuine 2026 data from the scraped webpage.
-     - Never output placeholder or 'tbc'.
-     - Set status: "AUTOFILLED".
-3. OUTDATED VS CURRENT DATA:
-   - If current box value has existing data:
-     - Check if the scraped webpage contains updated 2026 figures or details.
-     - If outdated: Extract the new 2026 published value. Status: "UPDATED".
-     - If already matches: Keep the existing value. Status: "VERIFIED_CURRENT".
-4. CONFIDENCE SCORING:
-   - "HIGH": Exact figure or curriculum table found directly on official webpage.
-   - "MEDIUM": Calculated (e.g. multiplied semester fee x 2 to get annual) or inferred from program structure.
-   - "LOW": Webpage was sparse; synthesized based on title. Human review advised.
-5. EVIDENCE SNIPPET:
-   - Quote a 1-sentence excerpt from the scraped text supporting your finding.
-6. DATA TYPE INTEGRITY:
-   - If the target column is clearly a fee/number and the current value is numeric, output pure numbers without currency text (or standard numbers).
-   - If the column is overview, output a clean 2-3 sentence description.
-   - If structure, output comma-separated subject codes and credits.`;
+CRITICAL SITE-SPECIFIC MATCHING:
+In this database, the data for "${columnName}" is published on the corresponding dedicated website:
+- If "${columnName}" is about Fees/Tuition: Check the site from the fee link ('site_from_course_fee_web_link' or 'site_from_fee_url').
+- If "${columnName}" is about Overview or Structure: Check the site from the course detail link ('site_from_course_detail_web_link').
+- If "${columnName}" is about Requirements: Check the admission or course detail link.
+
+DECISION PROTOCOL:
+1. DISCONTINUED: If the page says discontinued or returns 404, set status: "DISCONTINUED", verified_value: "Discontinued in 2026", confidence: "HIGH".
+2. MISSING / PLACEHOLDER: If current box is blank, 'tbc', 'abc', or 'none', extract the genuine 2026 value from the matching site. Status: "AUTOFILLED".
+3. OUTDATED VS CURRENT: If current box has data, compare with the matching site. If outdated, extract new 2026 figure (Status: "UPDATED"). If already matches, keep it (Status: "VERIFIED_CURRENT").
+4. CONFIDENCE: "HIGH" (exact match on dedicated site), "MEDIUM" (calculated/inferred), "LOW" (synthesized/unclear).
+5. EVIDENCE: Quote a 1-sentence excerpt from the specific site where the data was verified.`;
 
     const prompt = `
 TARGET COLUMN TO VERIFY: "${columnName}"

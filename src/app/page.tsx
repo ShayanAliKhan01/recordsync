@@ -380,6 +380,24 @@ export default function RecordSyncPage() {
               courseLink = url.trim();
             }
 
+            // Dynamically scan entire row for all dedicated links where data is available
+            const rowUrls: Record<string, string> = {};
+            parsedHeaderRow.forEach((h, hIdx) => {
+              const cellVal = String(r[hIdx] || "").trim();
+              if (cellVal.startsWith("http")) {
+                rowUrls[h] = cellVal;
+              } else {
+                const match = cellVal.match(/https?:\/\/[^\s"'<>]+/i);
+                if (match) {
+                  rowUrls[h] = match[0];
+                }
+              }
+            });
+
+            if (Object.keys(rowUrls).length === 0 && url.trim().startsWith("http")) {
+              rowUrls["general_url"] = url.trim();
+            }
+
             const currentFields: Record<string, any> = {};
             selectedCols.forEach((col) => {
               currentFields[col.name] = r[col.index];
@@ -390,6 +408,7 @@ export default function RecordSyncPage() {
               entityTitle: String(r[titleColIndex] || `Record #${actualRowIndex + 1}`).trim(),
               campus: campusColIndex !== -1 ? String(r[campusColIndex] || "").trim() : "",
               url: courseLink,
+              rowUrls,
               currentFields,
             };
           });
@@ -535,12 +554,31 @@ export default function RecordSyncPage() {
                 courseLink = url.trim();
               }
 
+              // Scan entire row for all dedicated links where data is available
+              const rowUrls: Record<string, string> = {};
+              parsedHeaderRow.forEach((h, hIdx) => {
+                const cellVal = String(r[hIdx] || "").trim();
+                if (cellVal.startsWith("http")) {
+                  rowUrls[h] = cellVal;
+                } else {
+                  const match = cellVal.match(/https?:\/\/[^\s"'<>]+/i);
+                  if (match) {
+                    rowUrls[h] = match[0];
+                  }
+                }
+              });
+
+              if (Object.keys(rowUrls).length === 0 && url.trim().startsWith("http")) {
+                rowUrls["general_url"] = url.trim();
+              }
+
               return {
                 rowIndex: actualRowIndex,
                 entityTitle: String(r[titleColIndex] || `Record #${actualRowIndex + 1}`).trim(),
                 campus: campusColIndex !== -1 ? String(r[campusColIndex] || "").trim() : "",
                 currentValue: r[colNumber],
                 url: courseLink,
+                rowUrls,
               };
             });
 
